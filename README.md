@@ -29,7 +29,7 @@
 
 - **Attention 插件**：多头注意力（MHA）/ MLA（DeepSeek R1 真实用的那个）
 - **Attention 实现**：选到 MLA 时多一个「矩阵吸收合并」执行方式，输出与朴素版逐元素相同
-- **FFN / MoE 插件**：dense FFN / DeepSeekMoE（路由 → 选专家 → 专家 → 共享专家叠加）
+- **FFN / MoE**：按 R1 结构（前 2 层 dense FFN、其余 MoE）——选不同层就能看到两种 FFN；MoE 展开成 路由 → 选专家 → 专家 → 共享专家叠加
 - **展示阶段开关**：Embedding / Attention / FFN-MoE / LM Head 四段可开关，关掉的**整段从流程里去掉**
 - **检视层**：4 层任选，前 2 层 dense、后 2 层 MoE
 - **流程总览**：整条链的张量方框图，点方框跳到该步；当前步的输入从哪来用带箭头的线画出

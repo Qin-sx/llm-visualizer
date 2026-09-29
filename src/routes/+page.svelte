@@ -14,7 +14,6 @@
 	import PlayerBar from '$lib/components/Player.svelte';
 
 	const attnOptions = listBySlot('attention');
-	const ffnOptions = listBySlot('ffn-moe');
 	const layerList = Array.from({ length: CONFIG.num_layers }, (_, i) => i);
 	/** 可开关的阶段（由流程声明，见 FlowSpec.stageToggles） */
 	const stageToggles = getFlow('llm').stageToggles ?? LLM_STAGE_TOGGLES;
@@ -158,14 +157,9 @@
 		{/if}
 
 		<label>
-			<span class="ctl-label">FFN / MoE 插件</span>
+			<span class="ctl-label">FFN / MoE</span>
 			<select bind:value={ffnId}>
-				<option value="auto">
-					按 R1 结构（前 {CONFIG.first_k_dense} 层 dense，其余 MoE）
-				</option>
-				{#each ffnOptions as o (o.id)}
-					<option value={o.id}>整网统一：{o.name}</option>
-				{/each}
+				<option value="auto">按 R1 结构（前 {CONFIG.first_k_dense} 层 dense，其余 MoE）</option>
 			</select>
 		</label>
 
