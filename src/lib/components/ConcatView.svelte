@@ -13,6 +13,8 @@
 	import { concatPhaseMs } from '$lib/core/steps';
 	import { maxAbsOf } from './color';
 	import MatrixGrid from './MatrixGrid.svelte';
+	import { realLabel } from './realShape';
+	import Emph from './Emph.svelte';
 
 	let { view, progress = 0 }: { view: ConcatView; progress?: number } = $props();
 
@@ -96,7 +98,8 @@
 						<span class="nm">{p.name}</span>
 						<span class="sz">[{p.shape.join(' × ')}]</span>
 					</div>
-					<div class="src">{p.label ?? '\u00a0'}</div>
+					<div class="real">{realLabel(p) ?? '\u00a0'}</div>
+					<div class="src"><Emph text={p.label ?? '\u00a0'} /></div>
 					<MatrixGrid data={p.data ?? []} {cellSize} />
 					<div class="cols">
 						占结果的第 {spans[i][0]}–{spans[i][1] - 1} 列
@@ -113,7 +116,8 @@
 				<span class="nm">{view.result.name}</span>
 				<span class="sz">[{view.result.shape.join(' × ')}]</span>
 			</div>
-			<div class="src">{view.result.label ?? '\u00a0'}</div>
+			<div class="real">{realLabel(view.result) ?? '\u00a0'}</div>
+			<div class="src"><Emph text={view.result.label ?? '\u00a0'} /></div>
 			<MatrixGrid
 				data={resultData}
 				{cellSize}
@@ -136,7 +140,8 @@
 					<span class="nm">{view.then.b.name}</span>
 					<span class="sz">[{view.then.b.shape.join(' × ')}]</span>
 				</div>
-				<div class="src">{view.then.b.label ?? '\u00a0'}</div>
+				<div class="real">{realLabel(view.then.b) ?? '\u00a0'}</div>
+				<div class="src"><Emph text={view.then.b.label ?? '\u00a0'} /></div>
 				<MatrixGrid
 					data={view.then.b.data ?? []}
 					{cellSize}
@@ -149,7 +154,8 @@
 					<span class="nm accent">{view.then.result.name}</span>
 					<span class="sz">[{view.then.result.shape.join(' × ')}]</span>
 				</div>
-				<div class="src">{view.then.result.label ?? '\u00a0'}</div>
+				<div class="real">{realLabel(view.then.result) ?? '\u00a0'}</div>
+				<div class="src"><Emph text={view.then.result.label ?? '\u00a0'} /></div>
 				<MatrixGrid
 					data={mmShown}
 					{cellSize}
@@ -274,6 +280,11 @@
 	.sz {
 		font-size: 0.66rem;
 		color: #4f46e5;
+	}
+	.real {
+		font-size: 0.58rem;
+		color: #94a3b8;
+		font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
 	}
 	.src {
 		font-size: 0.6rem;

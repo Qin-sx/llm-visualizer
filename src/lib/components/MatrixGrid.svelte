@@ -14,6 +14,7 @@
 		highlightRow,
 		highlightCol,
 		highlightCell,
+		highlightCols,
 		reveal,
 		onCellClick
 	}: {
@@ -24,6 +25,8 @@
 		highlightRow?: number;
 		highlightCol?: number;
 		highlightCell?: [number, number] | null;
+		/** 框出这几列（如"输出里被逆 RoPE 转的那几维"），整列加一层底色 + 外框 */
+		highlightCols?: number[];
 		/** 0..1：按行优先逐格揭示；不传则全部显示 */
 		reveal?: number;
 		onCellClick?: (i: number, j: number) => void;
@@ -117,6 +120,32 @@
 			stroke="#0ea5e9"
 			stroke-width="2"
 			pointer-events="none"
+		/>
+	{/if}
+
+	<!-- 框出的列：整列一层淡底 + 一个外框（用来指认"就是这几维"） -->
+	{#if highlightCols && highlightCols.length}
+		{@const cs = [...highlightCols].sort((a, b) => a - b)}
+		<rect
+			x={cs[0] * cellSize}
+			y="0"
+			width={(cs[cs.length - 1] - cs[0] + 1) * cellSize}
+			height={h}
+			fill="#f59e0b"
+			opacity="0.14"
+			pointer-events="none"
+		/>
+		<!-- 外框带 `data-highlight-cols`：探针/校验就靠它数"框了几处" -->
+		<rect
+			x={cs[0] * cellSize}
+			y="0"
+			width={(cs[cs.length - 1] - cs[0] + 1) * cellSize}
+			height={h}
+			fill="none"
+			stroke="#f59e0b"
+			stroke-width="2.5"
+			pointer-events="none"
+			data-highlight-cols="1"
 		/>
 	{/if}
 

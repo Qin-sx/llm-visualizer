@@ -5,6 +5,7 @@
 	import Dataflow from './Dataflow.svelte';
 	import Formula from './Formula.svelte';
 	import Tensor from './Tensor.svelte';
+	import Emph from './Emph.svelte';
 
 	let { step, progress = 0 }: { step: Step; progress?: number } = $props();
 
@@ -133,7 +134,7 @@
 	<div class="step-panel">
 		<div class="head">
 			<span class="kind">{step.kind}</span>
-			<span class="text-sm font-medium text-slate-800">{step.label}</span>
+			<span class="text-sm font-medium text-slate-800"><Emph text={step.label} /></span>
 		</div>
 
 		{#if step.formula}

@@ -6,12 +6,13 @@
 		note,
 		accent = false
 	}: { name: string; shape: number[]; note?: string; accent?: boolean } = $props();
+	import Emph from './Emph.svelte';
 </script>
 
 <div class="shape-tag" class:accent>
 	<span class="name">{name}</span>
 	<span class="dims">{shape.join(' × ')}</span>
-	{#if note}<span class="note">{note}</span>{/if}
+	{#if note}<span class="note"><Emph text={note} /></span>{/if}
 </div>
 
 <style>
@@ -26,6 +27,11 @@
 		font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
 		font-size: 0.72rem;
 		white-space: nowrap;
+		/*
+		 * 宽度不能超过所在格子：`step.tensors` 是自动填充网格，两个非 wide 视图同在一行时，
+		 * nowrap 的长文本会横穿盖住右边的内容。名字与尺寸仍然 nowrap，只有 note 允许折行。
+		 */
+		max-width: 100%;
 	}
 	.shape-tag.accent {
 		background: #eef2ff;
@@ -44,5 +50,7 @@
 	.note {
 		color: #94a3b8;
 		font-size: 0.65rem;
+		/* 长 note 折行，而不是撑宽整个 tag（见上面 .shape-tag 的注释） */
+		white-space: normal;
 	}
 </style>

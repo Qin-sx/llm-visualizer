@@ -7,23 +7,27 @@
  * 新增一条流程（diffusion / 多模态 / …）：仿照这里新写一个 `buildXxxFlow` 并
  * `registerFlow()` 即可。
  *
- * 算子（`mha` / `deepseek-moe` / …）依然由注册表提供——**本文件不含任何算子名**，
- * 只按插槽取当前选中的插件。
+ * 算子（`mha` / `csa` / `deepseek-moe` / …）依然由注册表提供——**本文件不含任何算子名**，
+ * 只按代表模型（`ModelSpec`）逐层取插件。V4 的注意力是逐层变的（SWA / CSA / HCA），
+ * 所以这里按层解析而不是"整网一个插件"。
  */
 import { buildFlow, type BuiltFlow, type StageOutput, type StageToggle } from '$lib/core/flow';
 import { getSemantics, registerFlow, resolvePlugin, type ResolvedPlugin } from '$lib/core/registry';
 import { softmaxRow } from '$lib/core/mat';
 import type { LayerCtx, SemanticsSpec } from '$lib/core/types';
-import { CONFIG, DEFAULT_FFN_BY_KIND, type LayerKind } from '$lib/model/config';
+import { attnIdFor, ffnIdFor, getModel, type ModelSpec } from '$lib/model/config';
 import { forward, type ModelTrace } from '$lib/model/forward';
 import { initWeights } from '$lib/model/init';
 import { embeddingLookup, nextTokenHead, type HeadData } from '$lib/stages';
 
 export interface LlmFlowOptions {
+	/** 代表模型 id（见 `MODELS`）；不传用 R1 */
+	modelId?: string;
+	/** 逐层固定的层用不到它；`null` 的那些层（R1）用它 */
 	attnId: string;
 	/** 注意力的**执行方式**（如 MLA 的矩阵吸收合并）；不给就用语义插件自带的实现 */
 	attnImplId?: string | null;
-	/** `'auto'` = 按 R1 结构（前 N 层 dense，其余 MoE）；否则整网统一用该插件 */
+	/** `'auto'` = 按模型结构；否则整网统一用该插件 */
 	ffnId: string;
 	layer?: number;
 	seed?: number;
@@ -53,9 +57,12 @@ export interface LlmFlowResult extends BuiltFlow {
 	trace: ModelTrace;
 	/** 当前检视的层号 */
 	layer: number;
-	/** 当前生效的注意力插件（语义 × 实现） */
+	/** 当前检视那一层的注意力插件（语义 × 实现） */
 	attn: ResolvedPlugin;
+	/** 当前检视那一层的 FFN 插件 */
 	ffnSpec: SemanticsSpec<any>;
+	/** 代表模型 */
+	model: ModelSpec;
 }
 
 /** LM Head 阶段的输入：最后一层的最后一个位置 */
@@ -72,22 +79,43 @@ function headDataOf(trace: ModelTrace, lmHead: number[][]): HeadData {
 }
 
 export function buildLlmFlow(opts: LlmFlowOptions): LlmFlowResult {
-	const weights = initWeights(opts.seed ?? CONFIG.seed);
-	// 语义 × 实现 → 当前生效的注意力插件（吸收合并这类"怎么算"的选择在这一层生效）
-	const attn = resolvePlugin(opts.attnId, opts.attnImplId);
+	const model = getModel(opts.modelId ?? 'r1');
+	const cfg = model.cfg;
+	const weights = initWeights(model, opts.seed);
 
-	const resolveFfn = (_l: number, kind: LayerKind) =>
-		opts.ffnId === 'auto' ? DEFAULT_FFN_BY_KIND[kind] : opts.ffnId;
+	/**
+	 * 逐层解析注意力：逐层固定的（V4）直接用模型给的 id；
+	 * `null` 的（R1）用用户在 `attnChoices` 里选的。
+	 *
+	 * 语义 × 实现 → 当前生效的插件，所以"吸收合并这类'怎么算'的选择"在这一层生效。
+	 */
+	const resolved = new Map<number, ResolvedPlugin>();
+	const resolveAttn = (layer: number) => {
+		const id = attnIdFor(model, layer, opts.attnId);
+		const key = `${id}|${opts.attnImplId ?? ''}`;
+		const cached = resolved.get(layer);
+		if (cached && `${cached.semantics.id}|${cached.implementation?.id ?? ''}` === key) return cached;
+		const plugin = resolvePlugin(id, opts.attnImplId);
+		resolved.set(layer, plugin);
+		return plugin;
+	};
 
-	const trace = forward(weights, attn, resolveFfn);
+	const trace = forward(
+		weights,
+		model,
+		resolveAttn,
+		// `'auto'` = 按模型结构（R1 前 2 层 dense、其余 MoE；V4 全 MoE）
+		(l) => (opts.ffnId === 'auto' ? ffnIdFor(model, l) : opts.ffnId)
+	);
 
-	const layer = opts.layer ?? CONFIG.first_k_dense;
+	const layer = opts.layer ?? 0;
 	const lt = trace.layers[layer];
+	const attn = resolveAttn(layer);
 	const ffnSpec = getSemantics(lt.ffnId);
 
 	const ctxFor = (key: string): LayerCtx => ({
 		layer,
-		cfg: CONFIG,
+		cfg,
 		w: weights.slots[key]?.[layer]
 	});
 
@@ -100,7 +128,7 @@ export function buildLlmFlow(opts: LlmFlowOptions): LlmFlowResult {
 			stage: embeddingLookup,
 			steps: embeddingLookup.steps(
 				{ tokenIds: trace.tokenIds, table: weights.embed, rows: trace.embed },
-				CONFIG
+				cfg
 			)
 		});
 	}
@@ -137,7 +165,7 @@ export function buildLlmFlow(opts: LlmFlowOptions): LlmFlowResult {
 	if (!off.has('lm-head')) {
 		outputs.push({
 			stage: nextTokenHead,
-			steps: nextTokenHead.steps(headDataOf(trace, weights.lmHead), CONFIG)
+			steps: nextTokenHead.steps(headDataOf(trace, weights.lmHead), cfg)
 		});
 	}
 
@@ -145,7 +173,7 @@ export function buildLlmFlow(opts: LlmFlowOptions): LlmFlowResult {
 	// 但 `buildFlow([])` 出来的 `steps` 是空数组，调用方要能处理
 	const built = buildFlow(outputs);
 
-	return { ...built, trace, layer, attn, ffnSpec };
+	return { ...built, trace, layer, attn, ffnSpec, model };
 }
 
 registerFlow({

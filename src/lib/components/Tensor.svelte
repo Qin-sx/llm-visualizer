@@ -16,6 +16,7 @@
 	import SumView from './SumView.svelte';
 	import TransformView from './TransformView.svelte';
 	import ValueRow from './ValueRow.svelte';
+	import Emph from './Emph.svelte';
 
 	let { view, progress = 0, compact = false }: { view: TensorView; progress?: number; compact?: boolean } = $props();
 
@@ -28,7 +29,8 @@
 
 <div
 	class="tensor"
-	class:wide={view.kind === 'matmul' ||
+	class:wide={view.wide ||
+		view.kind === 'matmul' ||
 		view.kind === 'mask' ||
 		view.kind === 'concat' ||
 		view.kind === 'transform' ||
@@ -42,7 +44,7 @@
 >
 	<!-- mask 视图自带表头（要和并排的 transform 对齐），所以不用这里的通用标签行 -->
 	{#if view.label && view.kind !== 'matmul' && view.kind !== 'mask'}
-		<div class="label">{view.label}</div>
+		<div class="label"><Emph text={view.label} /></div>
 	{/if}
 
 	{#if view.kind === 'shape'}

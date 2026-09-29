@@ -39,7 +39,7 @@
 		<!-- 本方案 -->
 		<div class="col mine">
 			<div class="col-title">
-				MLA：只存潜向量 + 位置编码
+				{view.mineTitle ?? 'MLA：只存潜向量 + 位置编码'}
 				<span class="badge ok">省</span>
 			</div>
 			<div class="blocks">
@@ -47,7 +47,8 @@
 					<div class="block">
 						<div class="blk-head">
 							<span class="nm">{b.name}</span>
-							<span class="sz">[{tokens} × {b.size}]</span>
+							<!-- 行数按这一块自己的数据来：滑窗块与压缩块的行数可以不同 -->
+							<span class="sz">[{b.data?.length ?? tokens} × {b.size}]</span>
 						</div>
 						<MatrixGrid data={b.data ?? []} cellSize={CELL} reveal={progress} />
 						{#if b.label}<div class="blk-label">{b.label}</div>{/if}
@@ -96,7 +97,7 @@
 
 	<div class="bars">
 		<div class="bar-row">
-			<span class="bar-label">MLA</span>
+			<span class="bar-label">{view.mineLabel ?? 'MLA'}</span>
 			<div class="bar-track">
 				<div
 					class="bar fill-mine"

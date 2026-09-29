@@ -15,6 +15,8 @@
 	import { sumPhaseMs } from '$lib/core/steps';
 	import MatrixGrid from './MatrixGrid.svelte';
 	import ValueRow from './ValueRow.svelte';
+	import { realLabel } from './realShape';
+	import Emph from './Emph.svelte';
 
 	let {
 		view,
@@ -78,7 +80,8 @@
 						<span class="sz">[{term.shape.join(' × ')}]</span>
 						{#if hasWeights}<span class="w">× {fmtW(wOf(j, currentRow))}</span>{/if}
 					</div>
-					<div class="src">{term.label ?? '\u00a0'}</div>
+					<div class="real">{realLabel(term) ?? '\u00a0'}</div>
+					<div class="src"><Emph text={term.label ?? '\u00a0'} /></div>
 					<MatrixGrid data={term.data ?? []} {cellSize} highlightRow={currentRow} />
 				</div>
 			{/each}
@@ -96,7 +99,8 @@
 					<span class="nm">{view.result.name}</span>
 					<span class="sz">[{view.result.shape.join(' × ')}]</span>
 				</div>
-				<div class="src">{view.result.label ?? '\u00a0'}</div>
+				<div class="real">{realLabel(view.result) ?? '\u00a0'}</div>
+				<div class="src"><Emph text={view.result.label ?? '\u00a0'} /></div>
 				<MatrixGrid
 					data={reveal(view.result.data, doneRows)}
 					{cellSize}
@@ -113,7 +117,8 @@
 						<span class="nm">{term.name}</span>
 						<span class="sz">[{term.shape.join(' × ')}]</span>
 					</div>
-					<div class="src">{term.label ?? '\u00a0'}</div>
+					<div class="real">{realLabel(term) ?? '\u00a0'}</div>
+					<div class="src"><Emph text={term.label ?? '\u00a0'} /></div>
 					<MatrixGrid data={term.data ?? []} {cellSize} highlightRow={currentRow2} />
 				</div>
 			{/each}
@@ -130,7 +135,8 @@
 					<span class="nm">{view.then.result.name}</span>
 					<span class="sz">[{view.then.result.shape.join(' × ')}]</span>
 				</div>
-				<div class="src">{view.then.result.label ?? '\u00a0'}</div>
+				<div class="real">{realLabel(view.then.result) ?? '\u00a0'}</div>
+				<div class="src"><Emph text={view.then.result.label ?? '\u00a0'} /></div>
 				<MatrixGrid
 					data={reveal(view.then.result.data, doneRows2)}
 					{cellSize}
@@ -253,6 +259,11 @@
 	.sz {
 		font-size: 0.66rem;
 		color: #4f46e5;
+	}
+	.real {
+		font-size: 0.58rem;
+		color: #94a3b8;
+		font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
 	}
 	.w {
 		font-size: 0.66rem;

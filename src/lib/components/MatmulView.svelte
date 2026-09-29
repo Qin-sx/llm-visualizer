@@ -14,6 +14,8 @@
 	import { refKey } from '$lib/core/overview';
 	import { matmulCellSize } from '$lib/core/steps';
 	import MatrixGrid from './MatrixGrid.svelte';
+	import { realLabel } from './realShape';
+	import Emph from './Emph.svelte';
 
 	let {
 		view,
@@ -91,18 +93,6 @@
 	});
 
 	const ratio = (f: number) => (f >= 10 ? String(Math.round(f)) : f.toFixed(1));
-
-	/** "真实 [7168 × 7168] · 行缩小 896× · 列缩小 896×" */
-	function realLabel(ref: MatRef): string | null {
-		const rs = ref.realShape;
-		if (!rs || rs.length < 2) return null;
-		const parts: string[] = [];
-		const rr = rs[0] / ref.shape[0];
-		const cr = rs[1] / ref.shape[1];
-		if (rr >= 1.5) parts.push(`行缩小 ${ratio(rr)}×`);
-		if (cr >= 1.5) parts.push(`列缩小 ${ratio(cr)}×`);
-		return `真实 [${rs.join(' × ')}] · ${parts.length ? parts.join(' · ') : '与真实同量级'}`;
-	}
 </script>
 
 {#snippet matBlock(o: {
@@ -127,7 +117,7 @@
 		     若条件渲染会导致同一行里 A/B/C 的网格起点错开一行 -->
 		<div class="badge-row">
 			{#if o.ref.label}
-				<span class="badge">{o.ref.label}</span>
+				<span class="badge"><Emph text={o.ref.label} /></span>
 			{/if}
 		</div>
 		<!-- "真实尺寸"这行同理：有些操作数没有 realShape，条件渲染一样会错开一行 -->

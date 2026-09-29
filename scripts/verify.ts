@@ -11,7 +11,7 @@ import '../src/lib/flows';
 import { buildLlmFlow, type LlmFlowResult } from '../src/lib/flows/llm';
 import { listFlows, getFlow, listImplementationsFor, resolvePlugin } from '../src/lib/core/registry';
 import { matRefsOf } from '../src/lib/core/overview';
-import { CONFIG } from '../src/lib/model/config';
+import { CONFIG, REAL_R1, REAL_V4_FLASH, R1_MODEL, V4_FLASH_MODEL, attnIdFor, pluginsOf } from '../src/lib/model/config';
 import { buildOverviewItems, itemKeys, refKey } from '../src/lib/core/overview';
 import {
 	animationUnits,
@@ -24,24 +24,158 @@ import {
 	MIN_PHASE_MS,
 	MIN_TEXT_CELL,
 	matmulCellSize,
+	transformCellSize,
 	transformPhaseMs,
 	concatPhaseMs,
 	sumPhaseMs,
 	viewDurationMs
 } from '../src/lib/core/steps';
 import { createPlayer } from '../src/lib/core/timeline';
-import { matmul, silu, softmaxRow } from '../src/lib/core/mat';
+import { matmul, ropeApply, silu, softmaxRow } from '../src/lib/core/mat';
 import { initWeights } from '../src/lib/model/init';
-import { REAL_R1 } from '../src/lib/model/config';
 import type { MhaTrace } from '../src/lib/slots/attention/mha';
 import type { MlaTrace } from '../src/lib/slots/attention/mla';
 import type { MlaAbsorbTrace } from '../src/lib/slots/attention/absorb';
+import type { HybridTrace } from '../src/lib/slots/attention/hybrid';
 import type { Step, MatRef } from '../src/lib/core/types';
 import type { MoeTrace } from '../src/lib/slots/ffn-moe/deepseek-moe';
 
 function assert(cond: unknown, msg: string) {
 	if (!cond) throw new Error('✗ ' + msg);
 	console.log('  ✓ ' + msg);
+}
+
+/**
+ * 本项目第一硬约束：**每个矩阵都要能逐格显示真实数字**（d_model = 8、
+ * vocab_size = 12 都是为它让的路）。格子尺寸的公式与 `MatmulView` 共用一份，
+ * "还能不能显示数字"才不会两边判断不一致。
+ *
+ * 注意只查 `matmul` 视图：`transform` / `mask` 用的是固定格子尺寸，
+ * 不会因为矩阵变宽而写不下数字。
+ */
+function assertCellSizes(steps: Step[], label: string) {
+	let tightest = Infinity;
+	let tightestDesc = '';
+	for (const step of steps) {
+		for (const t of step.tensors) {
+			if (t.kind === 'matmul') {
+				const size = matmulCellSize(
+					Math.max(t.out.shape[1] ?? 1, t.a.shape[1] ?? 1),
+					t.row !== undefined
+				);
+				if (size < tightest) {
+					tightest = size;
+					tightestDesc = `${t.a.shape.join('×')} @ ${t.b.shape.join('×')} = ${t.out.shape.join('×')}`;
+				}
+			} else if (t.kind === 'transform') {
+				// 变换视图的格子尺寸也是"渲染与校验共用一份"（链尾多一段时会按列数缩小）
+				const cols = t.input.data?.[0]?.length ?? 1;
+				const size = transformCellSize(cols, t.row !== undefined, !!t.tail);
+				if (size < tightest) {
+					tightest = size;
+					tightestDesc = `${step.id}/${t.name}（变换 ${t.input.shape.join('×')}）`;
+				}
+			}
+		}
+	}
+	assert(
+		tightest >= MIN_TEXT_CELL,
+		`${label}：所有矩阵的格子都 ≥ ${MIN_TEXT_CELL}px（最紧的 ${tightestDesc} → ${tightest}px），能逐格写数字`
+	);
+}
+
+/**
+ * 每个张量**标注的形状必须等于数据的形状**。
+ *
+ * `assertMatmulShapes` 只管矩阵乘的那三个操作数，而"这一页画出来的每一个块"
+ * 都可能标错（尤其是把 `[in × out]` 和 `[out × in]` 弄反、或者改了形状没改数据）。
+ */
+function assertRefShapes(steps: Step[], label: string) {
+	const bad: string[] = [];
+	for (const s of steps) {
+		for (const t of s.tensors) {
+			for (const r of matRefsOf(t)) {
+				if (!r.data) continue;
+				const got = [r.data.length, r.data[0]?.length ?? 0];
+				if (r.shape[0] !== got[0] || (r.shape[1] ?? 0) !== got[1]) {
+					bad.push(`${s.id}/${r.name}: 标注 [${r.shape.join('×')}] 数据 [${got.join('×')}]`);
+				}
+			}
+		}
+	}
+	assert(
+		bad.length === 0,
+		`${label}：每个张量标注的形状都和数据对得上` + (bad.length ? `（${bad.join('；')}）` : '')
+	);
+}
+
+/**
+ * 公式里的 LaTeX 命令**必须带反斜杠**：这些字符串是 JS 单引号 / 模板字符串，
+ * `'\m'` 里的反斜杠会被 JS 吃掉，页面会把命令名当普通字母排出来。
+ * 这类错误在数据侧看不出来（字符串本身合法），所以在这里兜一道：
+ * 命令名出现却没有反斜杠，就是漏了。
+ *
+ * 启发式：先剥掉 `\text{...}` 的内容再查，免得把 `\text{theta}` 这种
+ * 正常写法的内容当成"漏了反斜杠的命令"。
+ */
+const LATEX_CMDS = [
+	'mathcal',
+	'mathrm',
+	'left',
+	'right',
+	'frac',
+	'sqrt',
+	'tilde',
+	'qquad',
+	'quad',
+	'cdot',
+	'infty',
+	'sigma',
+	'theta',
+	'mathbf',
+	'partial',
+	'hat',
+	'bar',
+	'sum',
+	'prod'
+];
+function assertFormulas(steps: Step[], label: string) {
+	const bad: string[] = [];
+	for (const s of steps) {
+		if (!s.formula) continue;
+		// 先剥掉 `\text{...}` 的内容：那里面是普通文字，出现命令名不算漏反斜杠
+		const body = s.formula.replace(/\\text\{[^}]*\}/g, '');
+		for (const cmd of LATEX_CMDS) {
+			// 前面既不能是反斜杠（那样就是对的），也不能是字母（否则 `\qquad` 里的 `quad` 会误报）
+			if (new RegExp(`(?<![\\\\A-Za-z])${cmd}\\b`).test(body)) {
+				bad.push(`${s.id}: 公式里的 ${cmd} 没有反斜杠`);
+			}
+		}
+	}
+	assert(
+		bad.length === 0,
+		`${label}：公式里的 LaTeX 命令都带反斜杠（不会被 JS 吃掉）` +
+			(bad.length ? `（${bad.join('；')}）` : '')
+	);
+}
+
+/**
+ * 每个矩阵都要标**真实尺寸**——这是本项目的表示策略（见 `slots/attention/mha.ts` 的头注释）。
+ *
+ * `realShape` 一缺，页面上那一行就空着。以前只有 `matmul` / `lookup` 会渲染它，
+ * 所以 `transform` / `concat` / `sum` 里缺了也**看不出来**；现在五种视图都会渲染，
+ * 这条断言就是防"新加的视图忘了标"。
+ */
+function assertRealShapes(steps: Step[], label: string) {
+	const missing = steps.flatMap((s) =>
+		s.tensors.flatMap((t) =>
+			matRefsOf(t).filter((r) => !r.realShape).map((r) => `${s.id}/${r.name}`)
+		)
+	);
+	assert(
+		missing.length === 0,
+		`${label}：每个矩阵都标了真实尺寸` + (missing.length ? `（缺：${missing.join(' / ')}）` : '')
+	);
 }
 
 /**
@@ -258,24 +392,9 @@ if (probBars?.kind === 'bars') {
 }
 
 console.log('\n[尺寸硬约束]');
-// 本项目第一硬约束：**每个矩阵都要能逐格显示真实数字**（d_model=8、vocab_size=12 都为此让路）。
-// 格子尺寸的公式与 MatmulView 共用一份，"还能不能显示数字"才不会两边判断不一致。
-let tightest = Infinity;
-let tightestDesc = '';
-for (const step of demo.steps) {
-	for (const t of step.tensors) {
-		if (t.kind !== 'matmul') continue;
-		const size = matmulCellSize(Math.max(t.out.shape[1] ?? 1, t.a.shape[1] ?? 1), t.row !== undefined);
-		if (size < tightest) {
-			tightest = size;
-			tightestDesc = `${t.a.shape.join('×')} @ ${t.b.shape.join('×')} = ${t.out.shape.join('×')}`;
-		}
-	}
-}
-assert(
-	tightest >= MIN_TEXT_CELL,
-	`所有矩阵乘的格子都 ≥ ${MIN_TEXT_CELL}px（最紧的 ${tightestDesc} → ${tightest}px），能逐格写数字`
-);
+assertCellSizes(demo.steps, 'MHA + MoE');
+assertRealShapes(demo.steps, 'MHA + MoE');
+assertFormulas(demo.steps, 'MHA + MoE');
 
 console.log('\n[Attention 形状]');
 assert(attn.q.length === CONFIG.num_heads, `Q 头数 = ${CONFIG.num_heads}`);
@@ -424,6 +543,7 @@ for (const step of demo.steps) {
 console.log(`    共 ${matmulCount} 个矩阵乘视图，全部可逐格显示真实数字`);
 // 能带数据还不够——**形状必须真的能乘**（见 assertMatmulShapes 的注释）
 const mmDemo = assertMatmulShapes(demo.steps, 'MHA+MoE');
+assertRealShapes(dense.steps, 'dense-ffn');
 const mmDense = assertMatmulShapes(dense.steps, 'dense-ffn');
 console.log(`    形状自洽的矩阵乘：MHA+MoE ${mmDemo} 个、dense-ffn ${mmDense} 个`);
 
@@ -836,9 +956,20 @@ console.log('\n[分段时长的结构]');
 					`${s.id}/${t.name}：矩阵乘段时长与 then.b 一致（${w.mm}ms）`
 				);
 				assert(
-					w.mask + w.rows + w.mm === viewDurationMs(t),
-					`${s.id}/${t.name}：三段时长之和 = 视图时长（${viewDurationMs(t)}ms）`
+					t.tail ? w.tail > 0 : w.tail === 0,
+					`${s.id}/${t.name}：链尾段时长与 tail 一致（${w.tail}ms）`
 				);
+				assert(
+					w.mask + w.rows + w.mm + w.tail === viewDurationMs(t),
+					`${s.id}/${t.name}：各段时长之和 = 视图时长（${viewDurationMs(t)}ms）`
+				);
+				// 链尾段（`tail`）必须**接在最后**：进度 0.99 时矩阵乘段还没播完就说不过去了
+				if (t.tail) {
+					assert(
+						transformPhaseMs(t).tail > 0 && w.mm > 0,
+						`${s.id}/${t.name}：链尾段 ${t.tail.op} 排在矩阵乘段之后`
+					);
+				}
 			}
 			if (t.kind === 'concat') {
 				const w = concatPhaseMs(t);
@@ -1146,6 +1277,8 @@ let mlaDemoRef: LlmFlowResult | null = null;
 	const mlaDemo = buildLlmFlow({ attnId: 'mla', ffnId: 'auto', layer: MOE_LAYER });
 	mlaDemoRef = mlaDemo;
 	assertMatmulShapes(mlaDemo.steps, 'MLA');
+	assertRealShapes(mlaDemo.steps, 'MLA');
+	assertFormulas(mlaDemo.steps, 'MLA');
 	const t = mlaDemo.trace.layers[MOE_LAYER].attention as MlaTrace;
 	const S = CONFIG.seq_len;
 	const H = CONFIG.num_heads;
@@ -1155,7 +1288,7 @@ let mlaDemoRef: LlmFlowResult | null = null;
 	const kvr = CONFIG.kv_lora_rank!;
 	const qr = CONFIG.q_lora_rank!;
 	const dqk = dn + dr;
-	const mlaW = initWeights(CONFIG.seed).slots['mla'][MOE_LAYER] as {
+	const mlaW = initWeights(R1_MODEL).slots['mla'][MOE_LAYER] as {
 		Wukv: number[][];
 		Wa: number[][];
 		Wo: number[][];
@@ -1403,7 +1536,7 @@ console.log('\n[MLA 的「矩阵吸收合并」执行方式]');
 		`注意力分数也完全相同（最大误差 ${scoreErr.toExponential(1)}）—— 缩放因子仍是 1/√(d_h+d_h^R)`
 	);
 	// 手工验算合并公式：W̄^UQ = W^UQ·W^UKᵀ 必须真的等于"折进 Q"后的结果
-	const mlaW = initWeights(CONFIG.seed).slots['mla'][MOE_LAYER] as {
+	const mlaW = initWeights(R1_MODEL).slots['mla'][MOE_LAYER] as {
 		Wuq: number[][];
 		Wukv: number[][];
 		Wo: number[][];
@@ -1486,6 +1619,8 @@ console.log('\n[MLA 的「矩阵吸收合并」执行方式]');
 	);
 	assertNoDuplicateMatrices(absDemo.steps, 'MLA（吸收合并）');
 	assertMatmulShapes(absDemo.steps, 'MLA（吸收合并）');
+	assertRealShapes(absDemo.steps, 'MLA（吸收合并）');
+	assertFormulas(absDemo.steps, 'MLA（吸收合并）');
 	const mergeStep = absDemo.steps.find((s) => s.id === 'abs-merge')!;
 	const mergeMm = mergeStep.tensors.filter((t2) => t2.kind === 'matmul');
 	assert(
@@ -1605,6 +1740,479 @@ console.log('\n[MLA 的「矩阵吸收合并」执行方式]');
 	);
 	assert(ad.nodes !== nd.nodes, '吸收合并用的是**另一张图对象**（不是把朴素版那张改了）');
 
+}
+
+console.log('\n[DeepSeek V4 混合注意力：SWA / CSA / HCA]');
+{
+	// V4 的注意力是**逐层固定**的：`compress_ratios = [0,0,4,8]` → 前两层纯滑窗、
+	// 第三层 CSA、第四层 HCA。所以逐层各 build 一次。
+	const v4 = (layer: number) =>
+		buildLlmFlow({ modelId: 'v4-flash', attnId: '', ffnId: 'auto', layer });
+	const cfg = V4_FLASH_MODEL.cfg;
+	const S = cfg.seq_len;
+	const W = cfg.swa_window!;
+	const H = cfg.num_heads;
+	const hd = cfg.head_dim;
+	const dn = cfg.qk_nope_head_dim!;
+	const dr = cfg.qk_rope_head_dim!;
+	const G = cfg.o_groups!;
+	const oLora = cfg.o_lora_rank!;
+	const theta = cfg.rope_theta!;
+	// 两档压缩比（真实 4 / 128 缩放到 2 / 4）：CSA 压得轻、条目多；HCA 压得狠、条目少
+	const plan2 = cfg.compress_ratios![2];
+	const plan4 = cfg.compress_ratios![3];
+
+	console.log('    结构：');
+	assert(
+		V4_FLASH_MODEL.attnByLayer.join(',') === 'swa,swa,csa,hca',
+		`compress_ratios = ${JSON.stringify(cfg.compress_ratios)} → 逐层 SWA / SWA / CSA / HCA`
+	);
+	assert(
+		V4_FLASH_MODEL.attnChoices.length === 0,
+		'V4 的注意力逐层固定、不给用户选——所以"MLA 配 V4"这种组合根本不存在'
+	);
+	assert(
+		attnIdFor(V4_FLASH_MODEL, 2, 'mla') === 'csa',
+		'就算硬塞一个 attnId，逐层固定的层也仍然用自己的插件（塞不进 MLA）'
+	);
+	assert(
+		!pluginsOf(R1_MODEL).includes('csa') && !pluginsOf(R1_MODEL).includes('hca'),
+		'R1 只给 mha / mla 分配权重，V4 的插件连权重都不初始化'
+	);
+
+	const swaDemo = v4(0);
+	const csaDemo = v4(2);
+	const hcaDemo = v4(3);
+	assert(
+		swaDemo.trace.layers.map((l) => l.attnId).join(',') === 'swa,swa,csa,hca',
+		`一次前向里四层各用各的注意力插件（${swaDemo.trace.layers.map((l) => l.attnId).join(' / ')}）`
+	);
+	assert(
+		swaDemo.trace.layers.every((l) => l.ffnId === 'deepseek-moe'),
+		'V4 全 MoE：四层都是 deepseek-moe，没有 dense FFN 层'
+	);
+	for (const [label, d] of [
+		['SWA', swaDemo],
+		['CSA', csaDemo],
+		['HCA', hcaDemo]
+	] as const) {
+		assertMatmulShapes(d.steps, `V4 ${label}`);
+		assertRefShapes(d.steps, `V4 ${label}`);
+		assertRealShapes(d.steps, `V4 ${label}`);
+		assertFormulas(d.steps, `V4 ${label}`);
+		assertNoDuplicateMatrices(d.steps, `V4 ${label}`);
+		assertCellSizes(d.steps, `V4 ${label}`);
+		const blob = JSON.stringify(d.steps);
+		assert(
+			!blob.includes('{{step:') && !blob.includes('第 ? 步'),
+			`V4 ${label}：跨步骤引用全部解析成功（没有残留占位符）`
+		);
+	}
+
+	// ── Q / KV / 输出投影的形状 ──────────────────
+	console.log('    形状与 K = V：');
+	const sw = swaDemo.trace.layers[0].attention as HybridTrace;
+	assert(
+		[swaDemo, csaDemo, hcaDemo].every((d) =>
+			d.trace.layers.every((l) => l.attention.out.flat().every(Number.isFinite))
+		),
+		'三层注意力输出全是有限值（没有 NaN / Infinity 渗出来）'
+	);
+	assert(
+		sw.q.length === H && sw.q[0].length === S && sw.q[0][0].length === hd,
+		`q = [${H} 头 × ${S} × ${hd}]，每头 = ${dn} 维 nope + ${dr} 维 rope`
+	);
+	assert(
+		sw.kv.length === S && sw.kv[0].length === hd,
+		`KV 只有**一个头**、宽 ${hd}（真实 ${REAL_V4_FLASH.head_dim}）：K 和 V 就是同一份向量`
+	);
+	assert(
+		sw.groups.length === G && sw.groups[0][0].length === (H / G) * hd,
+		`输出分成 ${G} 组，每组 ${H / G} 头 × ${hd} 维（真实 ${REAL_V4_FLASH.o_groups} 组、每组 ${REAL_V4_FLASH.d_model} → ${REAL_V4_FLASH.o_lora_rank}）`
+	);
+	assert(
+		sw.oLatent[0].length === G * oLora && sw.out[0].length === cfg.d_model,
+		`分组低秩 → 拼回 ${G * oLora} 维 → W_O^B → ${cfg.d_model} 维`
+	);
+
+	// ── 页内排布 / 两条 RoPE 页的统一格式 ────────────
+	// 为什么单独查：这些块上下堆着、或把 RoPE 拆成独立"rope 段"小块，数值上完全正确，
+	// 只是读起来不是那个意思。
+	console.log('    页内排布：');
+	{
+		const attnSteps = swaDemo.steps.filter((s) => s.id.startsWith('swa-'));
+		const idx = (id: string) => attnSteps.findIndex((s) => s.id === id);
+		const qUp = attnSteps[idx('swa-q-up')];
+		const qNorm = attnSteps[idx('swa-q-norm-rope')];
+		assert(
+			!!qUp && !!qNorm && idx('swa-q-up') < idx('swa-q-norm-rope'),
+			'Q 的"每头归一化 + RoPE"从升维那页**单独拆出来**，排在它后面'
+		);
+		assert(
+			qUp.tensors.length === 2 && qNorm.tensors.length === 2,
+			`升维页只剩"归一化 → 升维"一条链 + 一行小字（${qUp.tensors.length} 块）；新页一条链 + 一行小字（${qNorm.tensors.length} 块）`
+		);
+
+		// 第 4 页（Q 归一化 + RoPE）与第 5 页（KV 归一化 + RoPE）**同一个格式**：
+		// 一条 `transform`（整块矩阵），RoPE 挂在**链尾**，末尾 dr 维在链尾段才被框出来。
+		const ropePages = ['swa-q-norm-rope', 'swa-kv-norm-rope'] as const;
+		const lastCol = Array.from({ length: dr }, (_, i) => dn + i).join(',');
+		for (const id of ropePages) {
+			const step = attnSteps[idx(id)];
+			const tf = step?.tensors.find((t) => t.kind === 'transform');
+			assert(
+				!!tf && tf.kind === 'transform' && !!tf.tail && !tf.then,
+				`${id}：归一化与 RoPE 合成**一条链**（RoPE 在链尾，没有第二段/矩阵乘）`
+			);
+			if (tf?.kind === 'transform') {
+				assert(
+					tf.tail!.result.shape.join('×') === tf.output.shape.join('×'),
+					`${id}：链尾前后是**同一块整矩阵**（${tf.output.shape.join('×')}），不是只画 rope 那几维`
+				);
+				assert(
+					tf.tail!.highlightCols?.join(',') === lastCol,
+					`${id}：框的是末尾 ${dr} 维（真实 ${REAL_V4_FLASH.rope_head_dim} 维）——和 O_h / O_h′ 那个框同一套规则`
+				);
+				assert(
+					!!tf.tail!.highlightCols?.length && tf.tail!.op === 'RoPE',
+					`${id}：链尾那一段就是 RoPE（"算到这一步才框出来"靠的就是它单独成段）`
+				);
+			}
+			assert(
+				step.tensors.filter((t) => t.kind === 'transform').length === 1,
+				`${id}：只有一个变换视图（RoPE 没有被拆成独立的"rope 段"小块）`
+			);
+		}
+
+		// `tail` 只支持"没有 then"或"then 是矩阵乘"两种，`then`（逐行）+ `tail` 的排版没实现
+		for (const d of [swaDemo, csaDemo, hcaDemo]) {
+			const bad = d.steps.flatMap((s) =>
+				s.tensors.filter((t) => t.kind === 'transform' && t.tail && t.then && !t.then.b).map((t) => `${s.id}/${t.name}`)
+			);
+			assert(
+				bad.length === 0,
+				`没有"逐行 then + tail"的视图（渲染没实现这种排法）${bad.length ? `：${bad.join(' ')}` : ''}`
+			);
+		}
+
+		const outA = attnSteps[idx('swa-out-a')];
+		const groups = outA.tensors.filter((t) => t.group !== undefined);
+		assert(
+			groups.length === G &&
+				groups.every((t) => t.row !== undefined && t.row === groups[0].row && !!t.parallel),
+			`${G} 组的分组投影**左右并排**（共用 row=${groups[0]?.row} + 各自 group + parallel → 中间不画箭头）`
+		);
+	}
+
+	// ── 滑窗掩码 + sink ─────────────────────────
+	console.log('    纯滑窗层：');
+	assert(
+		sw.nE === 0 && sw.cols === S + 1,
+		`纯滑窗层没有压缩条目：列数 = ${S} 个 token + 1 个 sink = ${sw.cols}`
+	);
+	let winOk = true;
+	let sinkOk = true;
+	let probsOk = true;
+	for (let i = 0; i < S; i++) {
+		for (let j = 0; j < S; j++) {
+			if (sw.mask[i][j] !== (j <= i && i - j < W ? 1 : 0)) winOk = false;
+		}
+		if (sw.mask[i][sw.sinkCol] !== 1) sinkOk = false;
+		const sum = sw.probs[0][i].reduce((a, b) => a + b, 0);
+		if (Math.abs(sum - 1) > 1e-9) probsOk = false;
+	}
+	assert(winOk, `滑窗掩码：第 i 个 token 只看 [i−${W}+1, i]，更早的一律 −∞`);
+	assert(
+		sinkOk,
+		'sink 偏置在掩码里恒为 1：它不是位置、而是分母上的一项——否则靠前的行会被整行掩掉，无从归一化'
+	);
+	assert(probsOk, 'softmax 每行和为 1（sink 也占一份权重）');
+	assert(
+		sw.probs[0].every((row) => row[sw.sinkCol] > 0),
+		'sink 槽拿到的权重 > 0：它确实在参与归一化，不是装饰'
+	);
+
+	// ── sink 没有"位置"（kernel 里是在循环之后折进分母的） ──
+	console.log('    sink 偏置：');
+	assert(
+		sw.sinkCol === S + sw.nE,
+		`sink 画在列空间的最后（第 ${sw.sinkCol} 列）——但这是**排版**，不是位置`
+	);
+	const permOk = (() => {
+		for (let i = 0; i < S; i++) {
+			const row = sw.maskedScores[0][i];
+			// 把 sink 那一列从末尾挪到**最前面**再 softmax：真实列的权重必须一模一样
+			const moved = [row[sw.sinkCol], ...row.slice(0, sw.sinkCol)];
+			const p2 = softmaxRow(moved);
+			for (let j = 0; j < sw.sinkCol; j++) {
+				if (Math.abs(sw.probs[0][i][j] - p2[j + 1]) > 1e-12) return false;
+			}
+		}
+		return true;
+	})();
+	assert(
+		permOk,
+		'把 sink 挪到第一列，真实列的权重**逐元素不变**——softmax 对顺序不敏感，sink 不是某个 token 的位置'
+	);
+	const numeratorOk = (() => {
+		// sink 只进分母：输出必须等于"只对真实列加权求和"（sink 的 V 是 0）
+		for (let i = 0; i < S; i++) {
+			for (let c = 0; c < hd; c++) {
+				let acc = 0;
+				for (let j = 0; j < sw.sinkCol; j++) {
+					const v = j < S ? sw.kv[j][c] : sw.compKv![j - S][c];
+					acc += sw.probs[0][i][j] * v;
+				}
+				if (Math.abs(acc - sw.headOut[0][i][c]) > 1e-12) return false;
+			}
+		}
+		return true;
+	})();
+	assert(
+		numeratorOk,
+		'输出里没有 sink 的贡献（它的 V 是 0）：分子只对真实列加权，sink 只把分母撑大'
+	);
+	assert(
+		sw.sink.length === H,
+		`sink 是**每头一个**可学习的标量（共 ${H} 个），不是全局一个、更不是某个 token 的键`
+	);
+	// P·V 的右操作数：V 的前 S+nE 行**逐元素等于 K**（K = V 共用），最后一行是 sink 的 0
+	assert(
+		sw.vAll.length === sw.sinkCol + 1,
+		`V 有 ${sw.vAll.length} 行 = 真实列 ${sw.sinkCol} + sink 1 行`
+	);
+	assert(
+		sw.vAll.every((row, j) =>
+			j === sw.sinkCol
+				? row.every((v) => v === 0)
+				: row.every((v, c) => Math.abs(v - sw.kAll[j][c]) < 1e-15)
+		),
+		'V 的前 S+nE 行**逐元素等于 K**（K = V 共用），最后一行（sink）全是 0'
+	);
+
+	// ── 逆 RoPE：绝对角度 → 相对角度 ─────────────
+	console.log('    逆 RoPE：');
+	const invOk = (() => {
+		for (let i = 0; i < S; i++) {
+			for (let c = dn; c < hd; c++) {
+				let acc = 0;
+				// kv[j] 已经转过 R(j)，所以这里要用**没转过**的 kvNorm[j] 再按相对位置 j−i 转
+				for (let j = Math.max(0, i - W + 1); j <= i; j++) {
+					acc +=
+						sw.probs[0][i][j] * ropeApply(sw.kvNorm[j].slice(dn), j - i, theta)[c - dn];
+				}
+				if (Math.abs(acc - sw.headOutInv[0][i][c]) > 1e-9) return false;
+			}
+		}
+		return true;
+	})();
+	assert(
+		invOk,
+		'逆 RoPE 把绝对角度转成了相对量：O_0 的 rope 段 = Σ_j P_ij · R(j−i)·k_j（用未旋转的 k_j 按位置差算）'
+	);
+
+	// ── 逆 RoPE 挂在链尾（`tail`），`O_h′` 就在 `O_h` 右边 ──────────
+	// 为什么单独查：把逆 RoPE 拆成独立视图也能算对（数值断言照样绿），
+	// 但页面上 `O_h` 会被画两次、还挂两个名字——用户要的是"O_h 旁边有一个 O_h′"。
+	{
+		const attnStep = swaDemo.steps.find((s) => s.id.endsWith('-attn'))!;
+		const chain = attnStep.tensors.find((t) => t.kind === 'transform')!;
+		assert(
+			chain.kind === 'transform' && !!chain.then?.b && !!chain.tail,
+			'逆 RoPE 挂在链尾：S ──softmax──▶ P_h ──×V──▶ O_h ──逆 RoPE──▶ O_h′ 是**一个**视图'
+		);
+		if (chain.kind === 'transform') {
+			const names = [chain.input.name, chain.output.name, chain.then!.result.name, chain.tail!.result.name];
+			assert(
+				names.join('→') === 'S（+ sink 列）→P_h→O_h→O_h′',
+				`链上的四块依次是 S → P_h → O_h → O_h′（实际 ${names.join(' → ')}）`
+			);
+			assert(
+				chain.tail!.result.data === (swaDemo.trace.layers[0].attention as HybridTrace).headOutInv[0],
+				'链尾画的就是逆 RoPE 的结果（head 0 的 O_h′），不是另算一份'
+			);
+			assert(
+				chain.tail!.highlightCols?.join(',') ===
+					Array.from({ length: dr }, (_, i) => dn + i).join(','),
+				`链尾框出的正是末尾 ${dr} 维（真实 ${REAL_V4_FLASH.rope_head_dim} 维），输入输出同一批列`
+			);
+			// 一步之内不能出现第二个"逆 RoPE"视图——那正是被合并掉的那个
+			assert(
+				attnStep.tensors.filter((t) => t.kind === 'transform').length === 1,
+				'这一步只有一个变换视图：逆 RoPE 没有被拆成单独一块'
+			);
+		}
+	}
+
+	// ── 压缩器（CSA：重叠窗口 + indexer） ────────
+	console.log('    CSA（2 倍压缩（真实 4）+ 重叠窗口 + indexer）：');
+	const cs = csaDemo.trace.layers[2].attention as HybridTrace;
+	const cg = cs.compress!.groups;
+	assert(cs.nE === 4, `2 倍压缩（真实 4）：${S} 个 token 压出 ${cs.nE} 条压缩条目`);
+	assert(
+		cg.every((g) => g.slots.length === plan2 * 2),
+		`重叠窗口：每条压缩条目看 ${plan2 * 2} 个 token = 上一组 ${plan2} 个 + 自己 ${plan2} 个`
+	);
+	assert(
+		cg[0].slots.filter((t) => t < 0).length === plan2,
+		`第 1 条没有"上一组"，窗口里 ${plan2} 个空槽（打分 −∞、权重 0）`
+	);
+	assert(
+		cg.map((g) => g.bornAt).join(',') === '1,3,5,7',
+		`压缩条目在 token ${cg.map((g) => g.bornAt).join(' / ')} 上才写出来——组收尾了才算得完`
+	);
+	let colOk = true;
+	let emptyOk = true;
+	for (const g of cg) {
+		for (let c = 0; c < hd; c++) {
+			const sum = g.weights.reduce((a, row) => a + row[c], 0);
+			if (Math.abs(sum - 1) > 1e-9) colOk = false;
+		}
+		g.slots.forEach((t, j) => {
+			if (t < 0 && g.weights[j].some((w) => w !== 0)) emptyOk = false;
+		});
+	}
+	assert(colOk, '逐通道 softmax：权重的每一**列**加起来是 1（不是每一行）');
+	assert(
+		cg.every((g) => g.weights.every((row) => row.every(Number.isFinite))),
+		'压缩权重全是有限值（空槽是 −∞ 打分，但权重必须是 0 而不是 NaN）'
+	);
+	assert(emptyOk, '空槽的权重恒为 0');
+	assert(
+		cs.compKv!.length === cs.nE && cs.compKv![0].length === hd,
+		`压缩 KV = [${cs.nE} × ${hd}]，和滑窗 KV 一样宽——所以能进同一个 softmax`
+	);
+
+	// indexer
+	const idx = cs.indexer!;
+	const topkK = cfg.index_topk!;
+	assert(
+		idx.topk.every((t, i) => t.length === Math.min(topkK, idx.candidates[i].length)),
+		`indexer 每个 query 在"已经写出来的条目"里挑最多 ${topkK} 条（真实 ${REAL_V4_FLASH.index_topk}）`
+	);
+	assert(
+		idx.topk[S - 1].length === topkK,
+		`最后一个 token 已经能看见全部 ${cg.length} 条，所以确实挑满 ${topkK} 条`
+	);
+	assert(
+		idx.logits.every((row, i) => row.every((v, e) => Number.isFinite(v) === (cg[e].bornAt <= i))),
+		'还没写出来的条目打分是 −∞（序列没走到那儿，它根本不存在）'
+	);
+	assert(
+		idx.topk.every((t, i) => t.every((e) => cg[e].bornAt <= i)),
+		'top-k 只从已经写出来的条目里挑'
+	);
+	assert(
+		idx.compressor.entriesReady[0].length === cfg.index_head_dim,
+		`indexer 用的是**自己那套**更窄的压缩 KV（${cfg.index_head_dim} 维，真实 ${REAL_V4_FLASH.index_head_dim}）`
+	);
+	let pickOk = true;
+	for (let i = 0; i < S; i++) {
+		for (let e = 0; e < cs.nE; e++) {
+			const want = idx.topk[i].includes(e) && cg[e].bornAt <= i ? 1 : 0;
+			if (cs.mask[i][S + e] !== want) pickOk = false;
+		}
+	}
+	assert(pickOk, '压缩条目只有被 indexer 选中的那些进 softmax，其余是 −∞');
+	assert(
+		cs.probs.every((head) => head.every((row) => Math.abs(row.reduce((a, b) => a + b, 0) - 1) < 1e-9)),
+		'两类 KV + sink 进的是**同一个** softmax（每行仍然和为 1）'
+	);
+
+	// ── 压缩器（HCA：不重叠、无 indexer） ────────
+	console.log('    HCA（4 倍压缩（真实 128）、无 indexer）：');
+	const hc = hcaDemo.trace.layers[3].attention as HybridTrace;
+	assert(hc.indexer === null, 'HCA 没有 indexer——条目本来就少，全看就行');
+	assert(hc.nE === 2, `4 倍压缩（真实 128）：${S} 个 token 压出 ${hc.nE} 条`);
+	assert(
+		hc.compress!.groups.every((g) => g.slots.length === plan4 && g.slots.every((t) => t >= 0)),
+		`不重叠：每条看 ${plan4} 个连续 token，没有空槽`
+	);
+	assert(
+		hc.mask.every((row, i) =>
+			row.slice(S, S + hc.nE).every((v, e) => v === (hc.compress!.groups[e].bornAt <= i ? 1 : 0))
+		),
+		'没有 indexer：已经写出来的压缩条目全部参与（稠密）'
+	);
+
+	// ── 数据流图（三种层型共用一张，缺的支路淡显） ──
+	console.log('    数据流图：');
+	const diagrams = [
+		['SWA', swaDemo, ['gate', 'w', 'entries', 'ckv', 'itop']],
+		['HCA', hcaDemo, ['itop']],
+		['CSA', csaDemo, []]
+	] as const;
+	for (const [label, d, goneWant] of diagrams) {
+		const attnSteps = d.steps.filter((s) => s.id.startsWith(label.toLowerCase()));
+		assert(
+			attnSteps.every((s) => !!s.diagram),
+			`V4 ${label}：每一步都带数据流图（${attnSteps.length} 步全覆盖）`
+		);
+		const dg = attnSteps[0].diagram!;
+		const ids = new Set(dg.nodes.map((n) => n.id));
+		assert(
+			attnSteps.every((s) => s.diagram!.nodes === dg.nodes && s.diagram!.edges === dg.edges),
+			`V4 ${label}：各步共用同一张图（只有高亮不同）`
+		);
+		assert(
+			!dg.nodes.some((n, i) => dg.nodes.findIndex((m) => m.col === n.col && m.row === n.row) !== i),
+			`V4 ${label}：没有两个节点占据同一个格子`
+		);
+		assert(
+			!dg.edges.some((e) => !ids.has(e.from) || !ids.has(e.to)),
+			`V4 ${label}：所有边的两端都指向存在的节点（共 ${dg.edges.length} 条）`
+		);
+		const bad = attnSteps.flatMap((s) =>
+			(s.diagram?.active ?? []).filter((id) => !ids.has(id)).map((id) => `${s.id}:${id}`)
+		);
+		assert(bad.length === 0, `V4 ${label}：每步高亮的节点都在图上（没有拼错的 id）`);
+		assert(
+			attnSteps.every((s) => (s.diagram?.active ?? []).length > 0),
+			`V4 ${label}：每一步都至少高亮一个节点`
+		);
+		// 关键：**图上每个节点都被某一步高亮过**——否则说明它只是装饰，或者 active 里写错了 id
+		const lit = new Set(attnSteps.flatMap((s) => s.diagram?.active ?? []));
+		const unlit = dg.nodes.filter((n) => !n.faded && !lit.has(n.id)).map((n) => n.id);
+		assert(
+			unlit.length === 0,
+			`V4 ${label}：图上每个节点都被某一步高亮过（漏掉：${unlit.join(' / ') || '无'}）`
+		);
+		const goneIds = dg.nodes.filter((n) => n.tone === 'gone').map((n) => n.id);
+		assert(
+			JSON.stringify([...goneIds].sort()) === JSON.stringify([...goneWant].sort()),
+			`V4 ${label}：这一层**没有**的支路标成灰色淡显（${goneIds.join(' / ') || '无'}）`
+		);
+		assert(
+			dg.nodes.filter((n) => n.tone === 'gone').every((n) => n.faded && !!n.sub),
+			`V4 ${label}：灰色节点同时淡显、并在小字里写明为什么没有`
+		);
+		assert(
+			!goneIds.some((id) => lit.has(id)),
+			`V4 ${label}：高亮里不会出现本层没有的灰色节点`
+		);
+		assert(
+			dg.edges.filter((e) => e.faded).length > 0 === goneIds.length > 0,
+			`V4 ${label}：缺支路的那些边一并淡显`
+		);
+	}
+	// 三种层型的图**布局完全一样**，只是标注不同——切层时是"同一张图变了颜色"
+	const posOf = (d: (typeof diagrams)[number][1]) => {
+		const dg = d.steps.find((s) => s.diagram)!.diagram!;
+		return dg.nodes
+			.map((n) => `${n.id}@${n.col},${n.row}`)
+			.sort()
+			.join(' ');
+	};
+	const base = posOf(csaDemo);
+	assert(
+		posOf(swaDemo) === base && posOf(hcaDemo) === base,
+		'SWA / CSA / HCA 用的是**同一套坐标**（同一张图，只换了颜色）'
+	);
+	assert(
+		csaDemo.steps.find((s) => s.diagram)!.diagram!.nodes !==
+			swaDemo.steps.find((s) => s.diagram)!.diagram!.nodes,
+		'三种层型各用**自己的图对象**（不是把同一张改了）'
+	);
 }
 
 console.log('\n[阶段开关]');

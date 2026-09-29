@@ -14,9 +14,10 @@
 	 * `onehot · W_E`，但那不是 embedding 的真实语义，所以单列一种视图。
 	 */
 	import type { LookupView, MatRef } from '$lib/core/types';
-	import { scaleLabel } from '$lib/model/config';
 	import MatrixGrid from './MatrixGrid.svelte';
 	import ValueRow from './ValueRow.svelte';
+	import { realLabel } from './realShape';
+	import Emph from './Emph.svelte';
 
 	let { view, progress = 0 }: { view: LookupView; progress?: number } = $props();
 
@@ -32,16 +33,6 @@
 	);
 
 	const cellSize = 24;
-
-	/** "真实 [129280 × 7168] · 行缩小 10773× · 列缩小 896×" */
-	function realNote(ref: MatRef): string | null {
-		const rs = ref.realShape;
-		if (!rs || rs.length < 2) return null;
-		const parts: string[] = [];
-		if (rs[0] / ref.shape[0] >= 1.5) parts.push(`行${scaleLabel(rs[0], ref.shape[0])}`);
-		if (rs[1] / ref.shape[1] >= 1.5) parts.push(`列${scaleLabel(rs[1], ref.shape[1])}`);
-		return `真实 [${rs.join(' × ')}] · ${parts.length ? parts.join(' · ') : '与真实同量级'}`;
-	}
 </script>
 
 {#snippet head(ref: MatRef, accent = false)}
@@ -52,8 +43,8 @@
 	</div>
 	<!-- 这两行都**恒定占位**（没有内容时塞不换行空格）：
 	     条件渲染会让同一行里各矩阵的顶边错开一行 -->
-	<div class="real">{ref.realShape ? realNote(ref) : '\u00a0'}</div>
-	<div class="src">{ref.label ?? '\u00a0'}</div>
+	<div class="real">{realLabel(ref) ?? '\u00a0'}</div>
+	<div class="src"><Emph text={ref.label ?? '\u00a0'} /></div>
 {/snippet}
 
 <div class="lk">

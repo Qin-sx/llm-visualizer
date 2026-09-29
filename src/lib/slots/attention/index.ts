@@ -11,9 +11,15 @@ import { register, registerImplementation } from '$lib/core/registry';
 import { mha } from './mha';
 import { mla } from './mla';
 import { mlaAbsorb } from './absorb';
+import { swa } from './swa';
+import { csa } from './csa';
+import { hca } from './hca';
 
 register(mha);
 register(mla);
+register(swa);
+register(csa);
+register(hca);
 registerImplementation(mlaAbsorb);
 
-export { mha, mla, mlaAbsorb };
+export { mha, mla, mlaAbsorb, swa, csa, hca };

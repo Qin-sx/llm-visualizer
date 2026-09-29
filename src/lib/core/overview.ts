@@ -95,9 +95,14 @@ export function buildOverviewItems(steps: Step[]): OverviewItem[] {
 					ops.push(t.op);
 					if (t.then?.b) {
 						node = { kind: 'matmul', id: `${step.id}:${t.name}:then`, stepId: step.id, a: t.output, b: t.then.b, out: t.then.result };
+						// 链尾还有一段逐行变换（`tail`，如逆 RoPE）：节点仍是这次矩阵乘，
+						// 只把它的名字带上，免得总览里"这一步干了什么"漏掉半截
+						if (t.tail) ops.push(t.tail.op);
 					} else if (t.then) {
 						ops.push(t.then.op);
-						node = { kind: 'unary', id: `${step.id}:${t.name}`, stepId: step.id, input: t.input, output: t.then.result, ops: [...ops] };
+						if (t.tail) ops.push(t.tail.op);
+						// 链尾有 `tail` 时，整条链的**最终产物**是 tail.result
+						node = { kind: 'unary', id: `${step.id}:${t.name}`, stepId: step.id, input: t.input, output: t.tail?.result ?? t.then.result, ops: [...ops] };
 					} else {
 						node = { kind: 'unary', id: `${step.id}:${t.name}`, stepId: step.id, input: t.input, output: t.output, ops: [...ops] };
 					}
@@ -188,7 +193,8 @@ export function matRefsOf(t: TensorView): MatRef[] {
 			return [
 				t.input,
 				t.output,
-				...(t.then ? [...(t.then.b ? [t.then.b] : []), t.then.result] : [])
+				...(t.then ? [...(t.then.b ? [t.then.b] : []), t.then.result] : []),
+				...(t.tail ? [t.tail.result] : [])
 			];
 		case 'concat':
 			return [...t.parts, t.result, ...(t.then ? [t.then.b, t.then.result] : [])];

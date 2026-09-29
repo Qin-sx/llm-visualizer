@@ -225,12 +225,14 @@ export const deepseekMoe: SemanticsSpec<MoeTrace> = {
 							name: 'r',
 							shape: [S, E],
 							data: trace.routerLogits,
+							realShape: [S, R.num_routed_experts],
 							label: `← 第 {{step:moe-route}} 步的路由分数`
 						},
 						output: {
 							name: 'p',
 							shape: [S, E],
 							data: trace.routerProbs,
+							realShape: [S, R.num_routed_experts],
 							label: '← 每行归一化后（和为 1）'
 						},
 						// 第二段接着 p 继续，p 不再重画
@@ -240,6 +242,7 @@ export const deepseekMoe: SemanticsSpec<MoeTrace> = {
 								name: 'g',
 								shape: [S, E],
 								data: g,
+								realShape: [S, R.top_k],
 								label: `← 每行只留 top-${K} 的权重，其余归零`
 							}
 						}
@@ -308,12 +311,14 @@ export const deepseekMoe: SemanticsSpec<MoeTrace> = {
 						name: `U^(E${e})`,
 						shape: [tokens.length, MI],
 						data: U,
+						realShape: [tokens.length, R.moe_intermediate],
 						label: `← 第 {{step:moe-experts}} 步的升维结果`
 					},
 					output: {
 						name: `H^(E${e})`,
 						shape: [tokens.length, MI],
 						data: H,
+						realShape: [tokens.length, R.moe_intermediate],
 						label: '← 逐元素激活后'
 					}
 				}))

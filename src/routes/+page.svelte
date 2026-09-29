@@ -2,8 +2,8 @@
 	import '$lib/slots'; // 副作用：注册全部算子插件
 	import '$lib/flows'; // 副作用：注册全部流程
 	import { untrack } from 'svelte';
-	import { getFlow, listBySlot, listImplementationsFor } from '$lib/core/registry';
-	import { CONFIG, layerKind } from '$lib/model/config';
+	import { getFlow, getSemantics, listImplementationsFor } from '$lib/core/registry';
+	import { getModel, layerKind, MODELS } from '$lib/model/config';
 	import { buildLlmFlow, LLM_STAGE_TOGGLES, type LlmFlowResult } from '$lib/flows/llm';
 	import { createPlayer, type Player } from '$lib/core/timeline';
 	import { animateHandoffs, resetHandoffs } from '$lib/core/handoff';
@@ -13,14 +13,28 @@
 	import StepPanel from '$lib/components/StepPanel.svelte';
 	import PlayerBar from '$lib/components/Player.svelte';
 
-	const attnOptions = listBySlot('attention');
-	const layerList = Array.from({ length: CONFIG.num_layers }, (_, i) => i);
+	/**
+	 * **代表模型**：注意力与 FFN 都按层定下来，所以 UI 上不是"自由组合插件"，
+	 * 而是"选一个代表模型 + 选一层"。非法组合（如 MLA 配 V4）因此根本不存在。
+	 */
+	let modelId = $state(MODELS[0].id);
+	const model = $derived(getModel(modelId));
+	const layerList = $derived(Array.from({ length: model.cfg.num_layers }, (_, i) => i));
 	/** 可开关的阶段（由流程声明，见 FlowSpec.stageToggles） */
 	const stageToggles = getFlow('llm').stageToggles ?? LLM_STAGE_TOGGLES;
 
-	let attnId = $state(attnOptions[0]?.id ?? 'mha');
-	let ffnId = $state('auto');
-	let layer = $state(CONFIG.first_k_dense);
+	/** 模型内可挑的注意力（R1 有 MHA / MLA）；空 = 逐层固定（V4） */
+	let attnId = $state(MODELS[0].attnChoices[0] ?? '');
+	let layer = $state(0);
+
+	/**
+	 * 换模型时把不适用的选择清掉：R1 选的 MLA 不能带进 V4，层号也要落在范围内。
+	 */
+	$effect(() => {
+		const m = getModel(modelId);
+		if (!m.attnChoices.includes(attnId)) attnId = m.attnChoices[0] ?? '';
+		if (layer >= m.cfg.num_layers) layer = 0;
+	});
 
 	/**
 	 * 关掉的阶段：默认按流程声明的 `defaultOn` 来（Attention / FFN-MoE 开，
@@ -50,7 +64,9 @@
 	// 不依赖客户端 JS 也能看到东西（也便于构建后直接验证渲染结果）。
 	// 只取初始值；后续变化由下面的 $effect 负责。
 	// svelte-ignore state_referenced_locally
-	let demo = $state<LlmFlowResult>(buildLlmFlow({ attnId, attnImplId, ffnId, layer, off: offStages }));
+	let demo = $state<LlmFlowResult>(
+		buildLlmFlow({ modelId, attnId, attnImplId, ffnId: 'auto', layer, off: offStages })
+	);
 	let stepIndex = $state(0);
 	/** 整条时间轴的进度（底部播放条用） */
 	let progress = $state(0);
@@ -85,9 +101,9 @@
 	// 步骤切换后，把跨步骤复用的矩阵（如 `attn-q` 算出的 Q）飞向它在新步骤里的位置
 	let lastHandoffStep = -1;
 
-	// 换插件或换层 → 重算数据并重建时间轴
+	// 换模型 / 换插件 / 换层 → 重算数据并重建时间轴
 	$effect(() => {
-		const result = buildLlmFlow({ attnId, attnImplId, ffnId, layer, off: offStages });
+		const result = buildLlmFlow({ modelId, attnId, attnImplId, ffnId: 'auto', layer, off: offStages });
 		resetHandoffs();
 		lastHandoffStep = -1; // 让下面的 effect 重新采集位置基线
 		demo = result;
@@ -119,6 +135,9 @@
 		demo.segments.find((s) => stepIndex >= s.from && stepIndex < s.to)?.stage ?? ''
 	);
 
+	/** 某一层用的注意力插件名（逐层固定时给 UI 显示用） */
+	const attnNameOf = (l: number) => getSemantics(demo.model.attnByLayer[l] ?? attnId).name;
+
 	function handleSpeed(v: number) {
 		speed = v;
 		player?.setSpeed(v);
@@ -136,13 +155,24 @@
 
 	<section class="controls">
 		<label>
-			<span class="ctl-label">Attention 插件</span>
-			<select bind:value={attnId}>
-				{#each attnOptions as o (o.id)}
-					<option value={o.id}>{o.name}</option>
+			<span class="ctl-label">代表模型</span>
+			<select bind:value={modelId}>
+				{#each MODELS as m (m.id)}
+					<option value={m.id}>{m.name}</option>
 				{/each}
 			</select>
 		</label>
+
+		{#if model.attnChoices.length > 1}
+			<label>
+				<span class="ctl-label">Attention 插件</span>
+				<select bind:value={attnId}>
+					{#each model.attnChoices as id (id)}
+						<option value={id}>{getSemantics(id).name}</option>
+					{/each}
+				</select>
+			</label>
+		{/if}
 
 		{#if attnImpls.length > 0}
 			<label>
@@ -156,13 +186,6 @@
 			</label>
 		{/if}
 
-		<label>
-			<span class="ctl-label">FFN / MoE</span>
-			<select bind:value={ffnId}>
-				<option value="auto">按 R1 结构（前 {CONFIG.first_k_dense} 层 dense，其余 MoE）</option>
-			</select>
-		</label>
-
 		<div class="layers">
 			<span class="ctl-label">检视层</span>
 			<div class="layer-row">
@@ -170,16 +193,18 @@
 					<button
 						class="layer-chip"
 						class:active={layer === l}
-						class:moe={layerKind(l) === 'moe'}
+						class:moe={layerKind(model.cfg, l) === 'moe'}
+						title={`第 ${l + 1} 层：${attnNameOf(l)}`}
 						onclick={() => (layer = l)}
 					>
-						{l + 1}
+						<span class="num">{l + 1}</span>
+						<span class="tag">{model.layerLabels[l]}</span>
 					</button>
 				{/each}
 			</div>
+			<!-- 注意力逐层固定的模型（V4）没有"选插件"的下拉，标签本身就是"这一层用什么" -->
 			<span class="legend">
-				<i class="dot dense"></i>dense
-				<i class="dot moe"></i>MoE
+				标签 = 这一层的{model.attnChoices.length > 1 ? 'FFN 类型' : '注意力类型'}
 			</span>
 		</div>
 
@@ -204,7 +229,7 @@
 		stages={demo.stages}
 		{activeStage}
 		{layer}
-		layerCount={CONFIG.num_layers}
+		layerCount={demo.model.cfg.num_layers}
 	/>
 
 	<!-- 流程总览放在流水线**下面**：先看清"整条链有哪几个阶段、当前在哪一段"，
@@ -224,11 +249,12 @@
 	</section>
 
 	<aside class="desc">
-		<div class="desc-title">{demo.attn.name} + {demo.ffnSpec.name}</div>
+		<div class="desc-title">{demo.model.name} · {demo.attn.name} + {demo.ffnSpec.name}</div>
+		<p>{demo.model.desc}</p>
 		<p>{demo.attn.desc}</p>
 		<p>{demo.ffnSpec.desc}</p>
 		<div class="caveat">
-			维度按 DeepSeek R1 结构等比缩小；权重为固定 seed
+			维度按 {demo.model.name} 的结构等比缩小；权重为固定 seed
 			的随机值——本页讲的是<b>机制</b>，不是知识。
 		</div>
 		<p class="lic"><a href="/licenses/">第三方许可 →</a></p>
@@ -331,14 +357,23 @@
 		gap: 0.25rem;
 	}
 	.layer-chip {
-		width: 1.9rem;
-		height: 1.9rem;
+		display: flex;
+		flex-direction: column;
+		align-items: center;
+		line-height: 1.1;
+		min-width: 2.4rem;
+		padding: 0.25rem 0.4rem;
 		border-radius: 0.375rem;
 		border: 1px solid #e2e8f0;
 		background: #ffffff;
 		color: #64748b;
 		font-size: 0.75rem;
 		cursor: pointer;
+	}
+	.layer-chip .tag {
+		font-size: 0.56rem;
+		letter-spacing: 0.02em;
+		opacity: 0.8;
 	}
 	.layer-chip.moe {
 		background: #fdf4ff;
@@ -374,19 +409,6 @@
 		gap: 0.3rem;
 		font-size: 0.62rem;
 		color: #94a3b8;
-	}
-	.dot {
-		width: 0.5rem;
-		height: 0.5rem;
-		border-radius: 999px;
-		display: inline-block;
-	}
-	.dot.dense {
-		background: #cbd5e1;
-	}
-	.dot.moe {
-		background: #e879f9;
-		margin-left: 0.4rem;
 	}
 	.stage {
 		min-height: 24rem;

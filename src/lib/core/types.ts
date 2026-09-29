@@ -60,6 +60,13 @@ export interface TensorViewBase {
 	 */
 	parallel?: boolean;
 	/**
+	 * 占满整行（跨过 `step.tensors` 那个自动填充网格的所有列）。
+	 *
+	 * 不 wide 的视图只拿到一格（约 220px）：一句长注解挤在那一格里会折成好几行，
+	 * 旁边要是还有别的视图，nowrap 的文本会横穿过去。注解长的视图（`shape` 的 `note`、`row` 的 `label`）把它打开。
+	 */
+	wide?: boolean;
+	/**
 	 * 在顶部"流程总览"里作为一个节点出现；值为显示名（如 `'P_h'`）。
 	 * 矩阵乘的操作数/结果会自动进总览，这个字段用于补充**单目运算**的产物
 	 * （如 softmax 之后的权重矩阵），从而让 `S_h → P_h` 也出现在流程里。
@@ -224,6 +231,8 @@ export interface ConcatView extends TensorViewBase {
  *                                          │ [B]      │   ← B 画在右上
  *      [输入] ──op1──▶ [输出 = A] ─────────┤ [A]  [C] │   ← 输出同时是这次矩阵乘的左操作数
  *                                          └──────────┘
+ *   4) 再加一段逐行变换（`tail`）：在第 3 种的 C 右边再接 `op3` 与 `[D]`——
+ *      `[输入] ──op1──▶ [A] ──op2(B)──▶ [C] ──op3──▶ [D]`，C 因此只画一次。
  *
  * 逐行处理——左侧输入矩阵的当前行高亮，右侧输出矩阵逐行揭示，
  * 下方给出当前行的前后数值对比。用于 softmax / top-k / SiLU 这类逐行独立计算的算子。
@@ -236,6 +245,14 @@ export interface TransformView extends TensorViewBase {
 	output: MatRef;
 	/** 运算名，如 'softmax' */
 	op: string;
+	/**
+	 * 在**输入与输出**矩阵上框出这几列（整列加底色 + 外框）。
+	 *
+	 * 用在"只有末尾几维被这个算子碰到"的场合——如输出做逆 RoPE 时，
+	 * 把 `O_h` 与 `O_h′` 里那几维都框出来，读者才知道转的是哪一段。
+	 * 两边用同一批列号：这一段的**位置**前后不变，变的只是值。
+	 */
+	highlightCols?: number[];
 	/**
 	 * 可选：输入块先做**逐格掩码**（如因果掩码 j > i → −∞），再做逐行变换。
 	 * 有了它，掩码和后面的变换共用同一个矩阵块——`S_h` 只画一次。
@@ -252,6 +269,25 @@ export interface TransformView extends TensorViewBase {
 		result: MatRef;
 		/** 矩阵乘的右操作数（给了它，这一段就是矩阵乘） */
 		b?: MatRef;
+	};
+	/**
+	 * 可选第三段，接着 `then.result` 再往下做**一次逐行变换**（如输出做逆 RoPE）。
+	 *
+	 * 加它就是为了"同一个矩阵只画一次、产物紧挨着产物"：
+	 *
+	 *   `S ──softmax──▶ P_h ──×V──▶ O_h ──逆 RoPE──▶ O_h′`
+	 *
+	 * 一条链走完，`O_h′` 就贴在 `O_h` 右边。不这么写的话，`O_h` 得在下一行再当一次输入
+	 * 画出来——同一个矩阵在一页里出现两次、还挂着两个名字
+	 * （用户指出："我是指 O_h 旁边有一个 O_h′，放在同一行"）。
+	 *
+	 * 只支持**逐行变换**，不支持矩阵乘：链尾再挂一个矩阵乘会多出两块，整行放不下。
+	 */
+	tail?: {
+		op: string;
+		result: MatRef;
+		/** 在 `then.result` 与 `tail.result` 上**同时**框出这几列（位置不变，只有值变） */
+		highlightCols?: number[];
 	};
 }
 
@@ -322,6 +358,10 @@ export interface LookupView extends TensorViewBase {
  */
 export interface KvCacheView extends TensorViewBase {
 	kind: 'kvcache';
+	/** 左侧（本方案）的标题；不填按 MLA 的说法 */
+	mineTitle?: string;
+	/** 左侧体积条上的短标签（如 `MLA` / `V4`）；不填按 MLA */
+	mineLabel?: string;
 	/** 本方案缓存的各块，按缓存里的顺序排开 */
 	blocks: {
 		name: string;
@@ -505,6 +545,32 @@ export interface ModelConfigLike {
 	qk_rope_head_dim?: number;
 	/** 每头 V 的维度 */
 	v_head_dim?: number;
+
+	// 混合注意力（DeepSeek V4）需要的维度，可选
+	/** 滑动窗口大小：最近这么多个 token 用**精确** KV（真实 128） */
+	swa_window?: number;
+	/**
+	 * 逐层的压缩比，长度 = `num_layers`：`0` 纯 SWA、`4` CSA、`128` HCA。
+	 * 真实 V4-Flash 是 43 层，demo 用官方 4 层 parity harness 的结构。
+	 */
+	compress_ratios?: number[];
+	/** RoPE 的底数（真实 10000） */
+	rope_theta?: number;
+	/**
+	 * 压缩层用的 RoPE 底数（真实 40000）。
+	 *
+	 * 纯滑窗层用主 RoPE，而 CSA / HCA 层整层换成压缩版 YaRN RoPE——**Q、滑窗 KV、
+	 * 压缩 KV 三处都用它**，所以底数必须跟着层走，不能全局写死一个。
+	 */
+	compress_rope_theta?: number;
+	/** indexer 的头数与每头维度（只有 CSA 层有 indexer） */
+	index_n_heads?: number;
+	index_head_dim?: number;
+	/** indexer 给压缩条目打分后取 top-k 参与注意力 */
+	index_topk?: number;
+	/** 输出投影的分组低秩（真实 `o_groups=8` / `o_lora_rank=1024`） */
+	o_groups?: number;
+	o_lora_rank?: number;
 }
 
 export interface LayerCtx {

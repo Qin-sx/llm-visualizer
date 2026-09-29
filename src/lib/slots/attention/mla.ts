@@ -718,6 +718,7 @@ export const mla: SemanticsSpec<MlaTrace> = {
 							name: `head ${i} 的输出`,
 							label: `← 第 {{step:mla-mask-softmax-av}} 步 head ${i} 算出的 O_h`,
 							shape: [S, dv],
+							realShape: [S, R.v_head_dim],
 							data: h
 						})),
 						result: {
@@ -796,7 +797,7 @@ export const mla: SemanticsSpec<MlaTrace> = {
 	}
 };
 
-/ 取一个必须有值的 MLA 维度——缺了就是配置没配全，早报错好过画出错图 */
+/** 取一个必须有值的 MLA 维度——缺了就是配置没配全，早报错好过画出错图 */
 function req(v: number | undefined, name: string): number {
 	if (v === undefined) {
 		throw new Error(`[mla] 配置缺少 ${name}`);

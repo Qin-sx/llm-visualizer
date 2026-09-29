@@ -357,12 +357,14 @@ export const mha: SemanticsSpec<MhaTrace> = {
 							name: `head ${i} 的输出`,
 							label: `← 第 {{step:attn-mask-softmax-av}} 步 head ${i} 算出的 O_h`,
 							shape: [S, dh],
+							realShape: [S, R.v_head_dim],
 							data: h
 						})),
 						result: {
 							name: 'Concat',
 							label: `← ${H} 个头横向拼起来（下面这次矩阵乘的左操作数就是它）`,
 							shape: [S, D],
+							realShape: [S, R.d_model],
 							data: trace.concat
 						},
 						// 第二段：Concat 直接当左操作数做输出投影

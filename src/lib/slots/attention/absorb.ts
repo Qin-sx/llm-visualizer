@@ -699,6 +699,7 @@ export const mlaAbsorb: ImplementationSpec<MlaAbsorbTrace> = {
 							name: `head ${i} 的输出`,
 							label: `← 第 {{step:abs-av}} 步 head ${i} 算出的 o_h`,
 							shape: [S, dc],
+							realShape: [S, R.kv_lora_rank],
 							data: h
 						})),
 						result: {

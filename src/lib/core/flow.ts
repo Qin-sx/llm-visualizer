@@ -138,6 +138,9 @@ export function resolveStepRefs(steps: Step[]): void {
 		step.label = fix(step.label) ?? step.label;
 		for (const t of step.tensors) {
 			if (t.label) t.label = fix(t.label);
+			// `shape` 的 `note`、`kvcache` 的 `note` 也是给人看的文案，同样要解析
+			// （漏掉的话页面上会直接显示 `{{step:xxx}}`——`verify` 有一条断言盯着）
+			if ((t.kind === 'shape' || t.kind === 'kvcache') && t.note) t.note = fix(t.note);
 			for (const ref of matRefsOf(t)) {
 				if (ref.label) ref.label = fix(ref.label);
 			}

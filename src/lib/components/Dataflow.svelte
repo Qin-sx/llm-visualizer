@@ -8,6 +8,7 @@
 	 * 图是静态的：不参与动画计时，只把本步正在算的节点高亮出来。
 	 */
 	import type { DataflowEdge, DataflowNode, DataflowSpec } from '$lib/core/types';
+	import Emph from './Emph.svelte';
 
 	let { spec }: { spec: DataflowSpec } = $props();
 
@@ -102,13 +103,13 @@
 	}
 
 	const LEGEND = [
-		{ tone: 'latent', text: '低秩潜向量（MLA 的关键：所有头共享）' },
-		{ tone: 'rope', text: '位置编码段（不可压缩，必须单独缓存）' },
+		{ tone: 'latent', text: '低秩潜向量 / 压缩条目' },
+		{ tone: 'rope', text: '位置编码段（只碰末尾几维）' },
 		{ tone: 'head', text: '按头升维后的 Q / K / V' },
-		{ tone: 'weight', text: '折出来的权重（只在加载时算一次）' },
+		{ tone: 'weight', text: '可学习的偏置' },
 		{ tone: 'cache', text: 'KV Cache' },
 		{ tone: 'absorbed', text: '吸收合并改动的环节' },
-		{ tone: 'gone', text: '吸收合并后不再需要的矩阵与路径' }
+		{ tone: 'gone', text: '不参与本层计算的矩阵与路径' }
 	];
 	/** 只有图上真出现这种配色时才列进图例 */
 	const shownLegend = $derived(
@@ -283,7 +284,7 @@
 	</div>
 
 	{#if spec.hint}
-		<div class="df-hint">{spec.hint}</div>
+		<div class="df-hint"><Emph text={spec.hint} /></div>
 	{/if}
 </div>
 

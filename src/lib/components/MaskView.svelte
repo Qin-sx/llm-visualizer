@@ -11,13 +11,22 @@
 	 */
 	import type { MaskView } from '$lib/core/types';
 	import { cellColor, cellTextColor, fmtCell, maxAbsOf } from './color';
+	import Emph from './Emph.svelte';
 
-	let {
-		view,
-		progress = 0,
-		compact = false,
-		bare = false
-	}: { view: MaskView; progress?: number; compact?: boolean; bare?: boolean } = $props();
+let {
+	view,
+	progress = 0,
+	compact = false,
+	bare = false,
+	cellSize: cellSizeProp
+}: {
+	view: MaskView;
+	progress?: number;
+	compact?: boolean;
+	bare?: boolean;
+	/** 被嵌进链式变换时由外层给定格子边长——必须和链上别的块一致，否则 S 与 P_h 大小对不上 */
+	cellSize?: number;
+} = $props();
 
 	const rows = $derived(view.scores.length);
 	const cols = $derived(view.scores[0]?.length ?? 0);
@@ -28,7 +37,7 @@
 	const done = $derived(Math.round(progress * total));
 	const currentIdx = $derived(Math.min(total - 1, done));
 
-	const cellSize = $derived(compact ? 24 : 34);
+	const cellSize = $derived(cellSizeProp ?? (compact ? 24 : 34));
 	const w = $derived(cols * cellSize);
 	const h = $derived(rows * cellSize);
 
@@ -58,7 +67,7 @@
 				<span class="nm">{view.matrixName ?? view.name}</span>
 				<span class="sz">[{rows} × {cols}]</span>
 			</div>
-			<div class="src">{view.label ?? '\u00a0'}</div>
+			<div class="src"><Emph text={view.label ?? '\u00a0'} /></div>
 		{/if}
 		<svg width={w} height={h} class="block">
 			{#each view.scores as row, i (i)}

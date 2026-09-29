@@ -77,6 +77,8 @@ export function phaseCells(t: TensorView): number[] {
 			// 逐行段：output 与"逐行接一段"的 then.result 是同时揭示的，算作一段
 			out.push(cellsOf(t.output.shape) + (t.then && !t.then.b ? cellsOf(t.then.result.shape) : 0));
 			if (t.then?.b) out.push(cellsOf(t.then.result.shape));
+			// 第三段（`tail`）：接着 then.result 再做一次逐行变换（如逆 RoPE）
+			if (t.tail) out.push(cellsOf(t.tail.result.shape));
 			return out;
 		}
 		case 'sum':
@@ -126,14 +128,21 @@ export function viewDurationMs(t: TensorView): number {
  * 注意：`phaseCells` 在"没有掩码段"时会少一项，所以这里必须**按段是否存在**依次取，
  * 不能按下标硬套——无掩码的变换（SiLU、softmax→top-k）会把"逐行段"当成"掩码段"，
  * `rows` 变成 0，逐行揭示被判成"已完成"，动画一上来就是终态。
+ * 链尾多一段（`tail`）同理：有没有它决定 `cells` 末尾有没有第四项。
  */
-export function transformPhaseMs(t: TransformView): { mask: number; rows: number; mm: number } {
+export function transformPhaseMs(t: TransformView): {
+	mask: number;
+	rows: number;
+	mm: number;
+	tail: number;
+} {
 	const cells = phaseCells(t);
 	let i = 0;
 	const mask = t.preMask ? msOf(cells[i++]) : 0;
 	const rows = msOf(cells[i++]);
 	const mm = t.then?.b ? msOf(cells[i++]) : 0;
-	return { mask, rows, mm };
+	const tail = t.tail ? msOf(cells[i++]) : 0;
+	return { mask, rows, mm, tail };
 }
 
 /** 链式相加各段的时长：加权求和段 + 可选的"叠加"段 */
@@ -218,4 +227,18 @@ export function matmulCellSize(maxDim: number, compact: boolean): number {
 	const budget = compact ? 200 : 290;
 	const cap = compact ? 22 : 34;
 	return Math.max(15, Math.min(cap, Math.floor(budget / Math.max(maxDim, 1))));
+}
+
+/**
+ * 变换视图的格子边长。
+ *
+ * 默认 34（数字读得清）。但**链尾还接了一段**（`tail`，如逆 RoPE）时，同一条链上会多出
+ * "中段箭头 + 末块"两块矩阵，整行会顶出容器；于是按列数反推一个放得下的尺寸。
+ * 下限仍是 `MIN_TEXT_CELL`——"每个矩阵都能逐格显示真实数字"这条硬约束不能因为
+ * 链变长就破掉（`verify` 对全部变换视图都断言这一点）。
+ */
+export function transformCellSize(cols: number, compact: boolean, hasTail = false): number {
+	if (compact) return 24;
+	if (!hasTail) return 34;
+	return Math.max(MIN_TEXT_CELL, Math.min(24, Math.floor(290 / Math.max(1, cols))));
 }
