@@ -77,12 +77,16 @@
 
 	// 带矩阵乘段时格子缩小一号，否则一行放不下（"横向放不下就把矩阵缩小一些"）
 	const cellSize = $derived(view.then ? 24 : 34);
+	/** 列的宽度上限：**最宽那块矩阵的宽 + 1/4**（原则 ④）；最后一列不封顶、把剩下的全吃掉（原则 ⑤） */
+	const cap = $derived(
+		(Math.max(...view.parts.map((p) => p.shape[1] ?? 0), view.result.shape[1] ?? 0) * cellSize * 5) / 4
+	);
 	const maxAbs = $derived(view.result.data ? maxAbsOf(view.result.data) : 1);
 	const fmt = (v: number | null | undefined) =>
 		v === null || v === undefined ? '—' : Math.abs(v) >= 100 ? v.toFixed(0) : v.toFixed(2);
 </script>
 
-<div class="concat">
+<div class="concat" style={`--cap:${cap}px;--last:1fr`}>
 	<!--
 		带矩阵乘段时排成 4 列 2 行（与 TransformView 的 with-b 同款）：
 		  (1,4) B=W_O
@@ -201,9 +205,15 @@
 		flex-direction: column;
 		gap: 0.6rem;
 	}
+	/* 列宽：下限是 `max-content`（**装得下内容**），上限才是 `--cap`（矩阵宽 + 1/4）——
+	   `--cap` 只限制"有富余时长多宽"，绝不会把本来就宽过它的那一列**压窄**。
+	   `max-content` 作下限时"growth limit < base"会退化成 base，天然不压内容。
+	   最后一列 `1fr` 把剩下的全吃掉。 */
 	.row {
 		display: grid;
-		grid-template-columns: auto auto auto;
+		grid-template-columns:
+			minmax(max-content, var(--cap, auto)) auto
+			minmax(max-content, var(--last, 1fr));
 		align-items: center;
 		justify-content: start;
 		column-gap: 0.7rem;
@@ -213,7 +223,9 @@
 	}
 	/* 带矩阵乘段：4 列 2 行 —— B 在右上、A 在左下、C 在右下 */
 	.row.with-mm {
-		grid-template-columns: auto auto auto auto;
+		grid-template-columns:
+			minmax(max-content, var(--cap, auto)) auto minmax(max-content, var(--cap, auto))
+			minmax(max-content, var(--last, 1fr));
 		align-items: start;
 	}
 	.row.with-mm .parts {

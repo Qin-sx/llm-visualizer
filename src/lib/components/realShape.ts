@@ -17,12 +17,20 @@ function ratio(f: number): string {
 	return f >= 10 ? String(Math.round(f)) : f.toFixed(1);
 }
 
-/** `真实 [7168 × 7168] · 行缩小 896× · 列缩小 896×`；没有 `realShape` 时返回 `null` */
+/**
+ * `真实 [7168 × 7168] · 行缩小 896× · 列缩小 896×`；没有 `realShape` 时返回 `null`。
+ *
+ * `ref.realParts` 有值时在后面补一段**分段尺寸**：`[v | s]` 这种"一块矩阵里其实是两样东西"的，
+ * 光看合计看不出"值占多少列、打分占多少列"。分段尺寸由声明者显式给出，不在这里反推（理由见 `MatRef.realParts`）。
+ */
 export function realLabel(ref: MatRef): string | null {
 	const rs = ref.realShape;
 	if (!rs || rs.length < 2) return null;
 	const parts: string[] = [];
 	if (rs[0] / ref.shape[0] >= 1.5) parts.push(`行缩小 ${ratio(rs[0] / ref.shape[0])}×`);
 	if (rs[1] / ref.shape[1] >= 1.5) parts.push(`列缩小 ${ratio(rs[1] / ref.shape[1])}×`);
-	return `真实 [${rs.join(' × ')}] · ${parts.length ? parts.join(' · ') : '与真实同量级'}`;
+	const seg = ref.realParts?.length
+		? `（${ref.realParts.map((p) => `${p.label} ${p.cols} 列`).join(' + ')}）`
+		: '';
+	return `真实 [${rs.join(' × ')}] · ${parts.length ? parts.join(' · ') : '与真实同量级'}${seg}`;
 }

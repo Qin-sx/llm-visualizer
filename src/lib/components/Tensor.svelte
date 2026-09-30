@@ -18,7 +18,16 @@
 	import ValueRow from './ValueRow.svelte';
 	import Emph from './Emph.svelte';
 
-	let { view, progress = 0, compact = false }: { view: TensorView; progress?: number; compact?: boolean } = $props();
+	/**
+	 * `cellSize`：标了 `fillWidth` 的行由 `StepPanel` 量出来（"占满可用宽度"的格子边长），
+	 * 原样透给带格子网格的视图；没有就由各视图自己按列数兜底。
+	 */
+	let {
+		view,
+		progress = 0,
+		compact = false,
+		cellSize
+	}: { view: TensorView; progress?: number; compact?: boolean; cellSize?: number } = $props();
 
 	const barMax = $derived(view.kind === 'bars' ? Math.max(1, ...view.data) : 1);
 	/** 已长出来的柱子数（不带动画的分布一次画满） */
@@ -52,13 +61,32 @@
 			<ShapeTag name={view.name} shape={view.shape} note={view.note} accent={view.accent} />
 		</div>
 	{:else if view.kind === 'row'}
-		<ValueRow data={view.data} labels={view.labels} scaleMax={view.scaleMax} />
+		<ValueRow
+			data={view.data}
+			labels={view.labels}
+			scaleMax={view.scaleMax}
+			reveal={view.animated ? progress : undefined}
+			revealGroup={view.revealGroup}
+		/>
 	{:else if view.kind === 'matrix'}
+		<!-- 有 `title`（显示名）时画一个和 transform / matmul 同款的表头——`matrix` 的
+		     `name` 是内部 id，不给人看（如压缩器的结果矩阵 `v̄`） -->
+		{#if view.title}
+			<div class="matrix-head">
+				<span class="nm">{view.title}</span>
+				<span class="sz">[{view.shape.join(' × ')}]</span>
+			</div>
+		{/if}
 		<MatrixGrid
 			data={view.data}
-			cellSize={26}
+			cellSize={cellSize ?? view.cellSize ?? (compact ? 22 : 26)}
 			highlightCell={view.highlight ?? null}
+			highlightRows={view.highlightRows}
+			highlightCols={view.highlightCols}
 			reveal={view.animated ? progress : undefined}
+			revealOrder={view.revealOrder}
+			revealGroup={view.revealGroup}
+			groupRows={view.groupRows}
 		/>
 	{:else if view.kind === 'tiles'}
 		<div class="flex flex-wrap gap-3">
@@ -85,13 +113,16 @@
 			{/each}
 		</div>
 	{:else if view.kind === 'matmul'}
-		<MatmulView {view} {progress} {compact} />
+		<MatmulView {view} {progress} {compact} cellSize={cellSize ?? view.cellSize} />
+	{:else if view.kind === 'ewise'}
+		<!-- 逐元素二元运算和矩阵乘共用同一个 2×2 视图（排布、动画都一样，只是没有 Σ） -->
+		<MatmulView {view} {progress} {compact} cellSize={cellSize ?? view.cellSize} />
 	{:else if view.kind === 'mask'}
-		<MaskView {view} {progress} {compact} />
+		<MaskView {view} {progress} {compact} cellSize={cellSize ?? view.cellSize} />
 	{:else if view.kind === 'concat'}
 		<ConcatView {view} {progress} />
 	{:else if view.kind === 'transform'}
-		<TransformView {view} {progress} {compact} />
+		<TransformView {view} {progress} {compact} cellSize={cellSize ?? view.cellSize} />
 	{:else if view.kind === 'sum'}
 		<SumView {view} {progress} {compact} />
 	{:else if view.kind === 'lookup'}
@@ -118,5 +149,23 @@
 		color: #94a3b8;
 		margin-bottom: 0.15rem;
 		font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+	}
+	/* matrix 视图的表头（有 `title` 时）：和 transform / matmul 的 `.head` 同款，
+	   名字 + 尺寸都是等宽字体，顶边才好跟同行矩阵对齐 */
+	.matrix-head {
+		display: flex;
+		align-items: baseline;
+		gap: 0.35rem;
+		padding: 0 0.3rem;
+		font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+	}
+	.matrix-head .nm {
+		font-size: 0.78rem;
+		font-weight: 700;
+		color: #334155;
+	}
+	.matrix-head .sz {
+		font-size: 0.66rem;
+		color: #4f46e5;
 	}
 </style>

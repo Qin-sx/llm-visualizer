@@ -26,8 +26,9 @@ import { transformCellSize, transformPhaseMs } from '$lib/core/steps';
 	let {
 		view,
 		progress = 0,
-		compact = false
-	}: { view: TransformView; progress?: number; compact?: boolean } = $props();
+		compact = false,
+		cellSize: cellSizeProp
+	}: { view: TransformView; progress?: number; compact?: boolean; cellSize?: number } = $props();
 
 	const rows = $derived(view.input.data?.length ?? 0);
 	const cols = $derived(view.input.data?.[0]?.length ?? 0);
@@ -37,18 +38,24 @@ import { transformCellSize, transformPhaseMs } from '$lib/core/steps';
 	const phaseWork = $derived(transformPhaseMs(view));
 	const maskWork = $derived(phaseWork.mask);
 	const rowWork = $derived(phaseWork.rows);
+	const row2Work = $derived(phaseWork.rows2);
 	const mmWork = $derived(phaseWork.mm);
 	const tailWork = $derived(phaseWork.tail);
-	const totalWork = $derived(Math.max(1, maskWork + rowWork + mmWork + tailWork));
+	const totalWork = $derived(Math.max(1, maskWork + rowWork + row2Work + mmWork + tailWork));
 	const endMask = $derived(maskWork / totalWork);
 	const endRow = $derived((maskWork + rowWork) / totalWork);
-	const endMm = $derived((maskWork + rowWork + mmWork) / totalWork);
+	const endRow2 = $derived((maskWork + rowWork + row2Work) / totalWork);
+	const endMm = $derived((maskWork + rowWork + row2Work + mmWork) / totalWork);
 
 	const maskP = $derived(maskWork ? Math.min(1, progress / endMask) : 1);
 	const rowP = $derived(
 		rowWork ? Math.min(1, Math.max(0, (progress - endMask) / (endRow - endMask))) : 1
 	);
-	const mmP = $derived(mmWork ? Math.min(1, Math.max(0, (progress - endRow) / (endMm - endRow))) : 1);
+	/** 第二段逐行（`then` 无 `b`）：**接着第一段**才跑，所以 `X ──op1──▶ Y ──op2──▶ Z` 是先后算的 */
+	const row2P = $derived(
+		row2Work ? Math.min(1, Math.max(0, (progress - endRow) / (endRow2 - endRow))) : 1
+	);
+	const mmP = $derived(mmWork ? Math.min(1, Math.max(0, (progress - endRow2) / (endMm - endRow2))) : 1);
 	const tailP = $derived(
 		tailWork ? Math.min(1, Math.max(0, (progress - endMm) / (1 - endMm))) : 1
 	);
@@ -56,6 +63,9 @@ import { transformCellSize, transformPhaseMs } from '$lib/core/steps';
 	// ── 逐行段 ───────────────────────────────────────────
 	const doneRows = $derived(Math.min(rows, Math.round(rowP * rows)));
 	const currentRow = $derived(Math.min(Math.max(0, rows - 1), doneRows));
+	/** 第二段逐行（`then` 无 `b`）已经算完的行数 */
+	const thenRows = $derived(view.then && !view.then.b ? (view.then.result.data?.length ?? 0) : 0);
+	const thenDoneRows = $derived(Math.min(thenRows, Math.round(row2P * thenRows)));
 	/** 链尾逐行段（`tail`）已经转完的行数 */
 	const tailDoneRows = $derived(Math.min(rows, Math.round(tailP * rows)));
 	const currentTailRow = $derived(Math.min(Math.max(0, rows - 1), tailDoneRows));
@@ -83,8 +93,15 @@ import { transformCellSize, transformPhaseMs } from '$lib/core/steps';
 	/**
 	 * 格子边长。默认 34（数字读得清）；**链尾还接了一段**（`tail`）时链上多出两块矩阵，
 	 * 整行会超宽，于是按列数反推一个放得下的尺寸（下限 `MIN_TEXT_CELL`）。
+	 *
+	 * `cellSizeProp`：`StepPanel` 给标了 `fillWidth` 的行量出"占满可用宽度"的边长之后传下来，
+	 * 优先用它；没有（SSR / 首帧 / 别的行）就退回上面的静态兜底。
 	 */
-	const cellSize = $derived(transformCellSize(cols, compact, !!view.tail));
+	// `cellSizeProp`（fillWidth 量出的占满边长）优先；`view.cellSize` 是视图自己要求放大
+	// （如 c128 的 4-5-6-7 步）；都没有（SSR / 首帧 / 别的行）退回静态兜底。
+	const cellSize = $derived(cellSizeProp ?? view.cellSize ?? transformCellSize(cols, compact, !!view.tail));
+	/** 每一列的宽度上限：**矩阵宽 + 1/4**（原则 ④）；最后一列不封顶、把剩下的全吃掉（原则 ⑤） */
+	const cap = $derived((cols * cellSize * 5) / 4);
 	const inRow = $derived(view.input.data?.[currentRow] ?? []);
 	const outRow = $derived(view.output.data?.[currentRow] ?? []);
 	const thenRow = $derived(view.then?.result.data?.[currentRow] ?? []);
@@ -112,9 +129,11 @@ import { transformCellSize, transformPhaseMs } from '$lib/core/steps';
 		<span class="nm" class:accent>{ref.name}</span>
 		<span class="sz">[{ref.shape.join(' × ')}]</span>
 	</div>
-	<!-- 来源标签行**恒定占位**（没有标签时塞一个不换行空格）。
-	     条件渲染会让同一行里"有标签的块"比"没标签的块"低一行，矩阵顶边就对不齐了。
-	     "真实尺寸"这行同理——四个块共用这个 snippet，所以要么都有、要么都留白。 -->
+{/snippet}
+
+{#snippet anno(ref: MatRef)}
+	<!-- 注解（真实尺寸 / 来源）放在矩阵**上面**、紧挨着名字。行数不同会顶歪矩阵顶边，
+	     所以 `StepPanel` 会给这一页的 `.head` / `.real` / `.src` **统一高度**。 -->
 	<div class="real">{realLabel(ref) ?? '\u00a0'}</div>
 	<div class="src"><Emph text={ref.label ?? '\u00a0'} /></div>
 {/snippet}
@@ -129,42 +148,57 @@ import { transformCellSize, transformPhaseMs } from '$lib/core/steps';
 	</div>
 {/snippet}
 
-<div class="tf">
+<!-- 同 `MatmulView`：并排（`compact`）时不设变量（兜底 `auto` = 原样），独占整行才摊 -->
+<div class="tf" class:fit={view.fillWidth} style={compact ? null : `--cap:${cap}px;--last:1fr`}>
 	<!-- 第二段是矩阵乘时整体排成 4 列 2 行：B 在右上、输出块（=左操作数 A）在左下、C 在右下 -->
-	<div class="row" class:chained={!!view.then} class:with-b={!!view.then?.b} class:has-tail={!!view.tail}>
-		<!-- ① 输入块（可选先做掩码） -->
-		<div class="side first">
-			{@render head(view.input)}
-			{#if maskView}
-				<MaskGrid bare view={maskView} progress={maskP} {compact} {cellSize} />
-				<div class="prog">
-					{#if maskP < 1}
-						<span class="now">掩码中 · 已处理 {Math.round(maskP * rows * cols)} / {rows * cols}</span>
-					{:else}
-						<span class="done">
-							掩码完成 · 屏蔽 {view.preMask?.flat().filter((m) => !m).length} 个
-						</span>
-					{/if}
-				</div>
-			{:else}
-				<MatrixGrid
-					data={view.input.data ?? []}
-					{cellSize}
-					highlightRow={currentRow}
-					highlightCols={view.highlightCols}
-				/>
-			{/if}
-		</div>
+	<div class="row" class:chained={!!view.then} class:with-b={!!view.then?.b} class:has-tail={!!view.tail} class:no-input={!!view.hideInput}>
+		{#if view.hideInput}
+			<!-- 输入块不画（`hideInput`）：行首放一个"算子名 + 箭头"的引头，链从输出开始——
+			     输入就是左边那块矩阵（如 `-compress-pool` 吞并 `-compress-kv` 时，v̄ 由 pool 的结果画） -->
+			<div class="mid lead">
+				<div class="op">{view.op}</div>
+				<div class="ar">──▶</div>
+			</div>
+		{:else}
+			<!-- ① 输入块（可选先做掩码） -->
+			<div class="side first">
+				{@render head(view.input)}
+				{#if maskView}
+					<!-- 掩码块也要走同样的"注解在上面"结构：少了这两行，它的矩阵会比旁边的
+					     块高两行，对不齐 -->
+					{@render anno(view.input)}
+					<MaskGrid bare view={maskView} progress={maskP} {compact} {cellSize} />
+					<div class="prog">
+						{#if maskP < 1}
+							<span class="now">掩码中 · 已处理 {Math.round(maskP * rows * cols)} / {rows * cols}</span>
+						{:else}
+							<span class="done">
+								掩码完成 · 屏蔽 {view.preMask?.flat().filter((m) => !m).length} 个
+							</span>
+						{/if}
+					</div>
+				{:else}
+					{@render anno(view.input)}
+					<MatrixGrid
+						data={view.input.data ?? []}
+						{cellSize}
+						highlightRow={currentRow}
+						highlightCols={view.highlightCols}
+					/>
+				{/if}
+			</div>
 
-		<div class="mid">
-			<div class="op">{view.op}</div>
-			<div class="ar">──▶</div>
-			<div class="hint">逐行</div>
-		</div>
+			<div class="mid">
+				<div class="op">{view.op}</div>
+				<div class="ar">──▶</div>
+				<div class="hint">逐行</div>
+			</div>
+		{/if}
 
 		<!-- ② 输出块（第二段是矩阵乘时，它就是这次矩阵乘的左操作数） -->
 		<div class="side result">
 			{@render head(view.output, true)}
+			{@render anno(view.output)}
 			<MatrixGrid
 				data={reveal(view.output.data)}
 				{cellSize}
@@ -180,16 +214,19 @@ import { transformCellSize, transformPhaseMs } from '$lib/core/steps';
 			<!-- ③ B 在右上 -->
 			<div class="side top-right">
 				{@render head(view.then.b)}
+				{@render anno(view.then.b)}
 				<MatrixGrid
 					data={view.then.b.data ?? []}
 					{cellSize}
 					highlightCol={mmP > 0 ? mmJ : undefined}
+					bands={view.then.b.bands}
 				/>
 			</div>
 
 			<!-- ④ C 在右下 -->
 			<div class="side final">
 				{@render head(view.then.result, true)}
+				{@render anno(view.then.result)}
 				<MatrixGrid
 					data={mmShown}
 					{cellSize}
@@ -207,20 +244,27 @@ import { transformCellSize, transformPhaseMs } from '$lib/core/steps';
 			</div>
 			<div class="side final">
 				{@render head(view.then.result, true)}
+				{@render anno(view.then.result)}
 				<MatrixGrid
-					data={reveal(view.then.result.data)}
+					data={reveal(view.then.result.data, thenDoneRows)}
 					{cellSize}
-					highlightRow={currentRow}
+					highlightRow={thenDoneRows}
 					highlightCols={tailP > 0 ? view.tail?.highlightCols : undefined}
 				/>
-				{@render progBar()}
+				<div class="prog">
+					{#if row2P < 1}
+						<span class="now">已算 <b>{thenDoneRows}</b> / {thenRows} 行</span>
+					{:else}
+						<span class="done">已算完 {thenRows} 行</span>
+					{/if}
+				</div>
 			</div>
 		{/if}
 
 		<!--
 			链尾再一段逐行（`tail`，如 RoPE / 逆 RoPE）：上一块已经是它的输入，所以上一块只画一次。
 			"框出来的那几列"同时落在**上一块**和**这一块**上，而且**只在这一段计算时才出现**
-			（`tailP > 0`）——用户要的就是"先看到整块矩阵，算到这一步才把那几维框出来"。
+			（`tailP > 0`）——先看到整块矩阵，算到这一步才把那几维框出来。
 		-->
 		{#if view.tail}
 			<div class="mid tail-mid">
@@ -230,6 +274,7 @@ import { transformCellSize, transformPhaseMs } from '$lib/core/steps';
 			</div>
 			<div class="side tail-final">
 				{@render head(view.tail.result, true)}
+				{@render anno(view.tail.result)}
 				<MatrixGrid
 					data={reveal(view.tail.result.data, tailDoneRows)}
 					{cellSize}
@@ -293,9 +338,19 @@ import { transformCellSize, transformPhaseMs } from '$lib/core/steps';
 		flex-direction: column;
 		gap: 0.7rem;
 	}
+	/*
+	 * 列宽：装得下内容之后还能长到 `--cap`（= 矩阵宽 + 1/4，原则 ④：矩阵之间的间距变大、
+	 * 注解跟着变宽）；**最后一列** `1fr` 把剩下的全吃掉（原则 ⑤：注解一直延伸到行右边界，
+	 * 且天然不超出容器）。
+	 *
+	 * 下限是 `auto`（= min-content）而不是 `max-content`：并排（`compact`）时要能压缩，
+	 * 否则整行顶出去；而这个视图的列内容就是矩阵本身（`.detail` 是 `width: 0; min-width: 100%`），
+	 * 所以 `auto` 不会比 `max-content` 窄——`--cap` 只限制"长多宽"，压不窄内容
+	 * （`ConcatView` / `SumView` / `LookupView` 里有 nowrap 说明文字，它们必须用 `max-content`）。
+	 */
 	.row {
 		display: grid;
-		grid-template-columns: auto auto auto;
+		grid-template-columns: minmax(auto, var(--cap, auto)) auto minmax(auto, var(--last, auto));
 		align-items: start;
 		justify-content: start;
 		column-gap: 0.8rem;
@@ -304,15 +359,33 @@ import { transformCellSize, transformPhaseMs } from '$lib/core/steps';
 		padding-bottom: 0.2rem;
 	}
 	.row.chained {
-		grid-template-columns: auto auto auto auto auto;
+		grid-template-columns:
+			minmax(auto, var(--cap, auto)) auto minmax(auto, var(--cap, auto)) auto
+			minmax(auto, var(--last, auto));
 	}
 	/* 只有链尾、没有第二段（如"归一化 ──▶ RoPE"）：5 列一行排开 */
 	.row.has-tail:not(.with-b) {
-		grid-template-columns: auto auto auto auto auto;
+		grid-template-columns:
+			minmax(auto, var(--cap, auto)) auto minmax(auto, var(--cap, auto)) auto
+			minmax(auto, var(--last, auto));
+	}
+	/*
+	 * 输入块不画（`hideInput`）：链从输出开始——行首的"引头"（算子名 + 箭头）占第 1 列，
+	 * 输出 / 中间箭头 / 最终结果各占一列。放在 `.chained` 之后（同特异性，后者生效）。
+	 */
+	.row.no-input {
+		grid-template-columns: auto minmax(auto, var(--cap, auto)) auto minmax(auto, var(--last, auto));
+	}
+	.row.no-input .mid.lead {
+		align-self: center;
+		display: flex;
+		flex-direction: column;
+		align-items: center;
+		gap: 0.1rem;
 	}
 	/*
 	 * 链式变换中间那一段（算子名 + 箭头）的宽度**就是**两块矩阵之间的距离：
-	 * 列间隙和算子名字号各收一点，S 与 P_h 就贴近一些（用户要求"更近一些"）。
+	 * 列间隙和算子名字号各收一点，S 与 P_h 就贴近一些。
 	 * 再往下压就得把 `softmax` 竖排或删掉了——那三个字本身还有 ~40px。
 	 */
 	.row.chained {
@@ -323,7 +396,9 @@ import { transformCellSize, transformPhaseMs } from '$lib/core/steps';
 	}
 	/* 第二段是矩阵乘：4 列 2 行，B 右上 / A 左下 / C 右下 */
 	.row.with-b {
-		grid-template-columns: auto auto auto auto;
+		grid-template-columns:
+			minmax(auto, var(--cap, auto)) auto minmax(auto, var(--cap, auto))
+			minmax(auto, var(--last, auto));
 	}
 	.row.with-b .side.first {
 		grid-area: 2 / 1;
@@ -342,7 +417,9 @@ import { transformCellSize, transformPhaseMs } from '$lib/core/steps';
 	}
 	/* 链尾再接一段（`tail`）：多出"中段箭头 + 末块"两列，排在 C 的右边 */
 	.row.with-b.has-tail {
-		grid-template-columns: auto auto auto auto auto auto;
+		grid-template-columns:
+			minmax(auto, var(--cap, auto)) auto minmax(auto, var(--cap, auto))
+			minmax(auto, var(--cap, auto)) auto minmax(auto, var(--last, auto));
 	}
 	.row.with-b.has-tail .mid.tail-mid {
 		grid-area: 2 / 5;

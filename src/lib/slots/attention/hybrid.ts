@@ -34,7 +34,7 @@ import {
 	type Mat,
 	type Vec
 } from '$lib/core/mat';
-import type { ModelConfigLike, Step } from '$lib/core/types';
+import type { MatrixBand, ModelConfigLike, Step } from '$lib/core/types';
 import { REAL_V4_FLASH } from '$lib/model/config';
 import {
 	compress,
@@ -524,6 +524,7 @@ export function hybridHeadSteps(
 					name: `${prefix}-q-head-norm-rope`,
 					kind: 'transform',
 					shape: [S, hd],
+					cellSize: 32,
 					op: 'RMSNorm（每头）',
 					input: ref(
 						'q_0',
@@ -577,6 +578,8 @@ export function hybridHeadSteps(
 					name: `${prefix}-kv-norm-rope`,
 					kind: 'transform',
 					shape: [S, hd],
+					// 同 q-norm-rope：c128 4-5-6-7 步放大（24 → 32）
+					cellSize: 32,
 					op: 'RMSNorm',
 					input: ref('k_raw', trace.kvRaw, [S, hd], [S, R.head_dim], 'latent'),
 					output: ref('k~', trace.kvNorm, [S, hd], [S, R.head_dim]),
@@ -622,12 +625,30 @@ export function hybridTailSteps(
 	const flow = (active: string[]) => v4Diagram(variant, active);
 
 	const colLayout = [
-		`前 ${S} 列 = 窗口里的 token`,
-		nE ? `接着 ${nE} 列 = 压缩条目` : null,
+		`前 ${S} 列 = 每个 token 的精确 KV（**蓝框**；每行只留滑窗内那 ${W} 个）`,
+		nE ? `接着 ${nE} 列 = 压缩条目（**琥珀框**）` : null,
 		`最后 1 列 = sink 空槽`
 	]
 		.filter(Boolean)
 		.join('、');
+
+	/**
+	 * K / V 上的**分组框**（`MatRef.bands`）：把"滑窗里的精确 token"和"压缩条目"分成两段框出来。
+	 *
+	 * 两个颜色在 K 和 V 上**一致**：蓝 = 局部精确（滑窗）、琥珀 = 远处压缩（c128）——
+	 * 换一块矩阵也认得出同一类东西。纯滑窗层没有压缩段（`nE = 0`），不画框。
+	 */
+	const swaBand = (axis: MatrixBand['axis']): MatrixBand => ({ axis, from: 0, to: S - 1, tone: '#38bdf8' });
+	const compBand = (axis: MatrixBand['axis']): MatrixBand => ({
+		axis,
+		from: S,
+		to: S + nE - 1,
+		tone: '#fbbf24'
+	});
+	/** K 的列（`Kᵀ` 的列 = 位置） */
+	const kvColBands: MatrixBand[] | undefined = nE ? [swaBand('col'), compBand('col')] : undefined;
+	/** V 的行（行 = 位置）；末行 sink 不框 */
+	const kvRowBands: MatrixBand[] | undefined = nE ? [swaBand('row'), compBand('row')] : undefined;
 
 	const cacheBlocks: {
 		name: string;
@@ -664,7 +685,7 @@ export function hybridTailSteps(
 			kind: 'MATMUL',
 			diagram: flow(['q', 'kv', 'ckv', 'itop']),
 			label: nE
-				? `每个头算 Q_h·K_hᵀ 再除以 √${hd} 缩放，得到分数矩阵 S。K 是**所有真实列**拼起来的：前 ${S} 列是滑窗里的 token、后 ${nE} 列是压缩条目——所以这一步就把"局部精确 + 远处压缩"放进同一个矩阵了。sink 偏置**不在这里**（它不是点积，是直接加在分数上的一项，见下）`
+				? `每个头算 Q_h·K_hᵀ 再除以 √${hd} 缩放，得到分数矩阵 S。K 是**所有真实列**拼起来的：前 ${S} 列是每个 token 的**精确 KV**（**蓝框**；每行只有滑窗内那 ${W} 个是活的，其余会被掩码）、后 ${nE} 列是**压缩条目**（**琥珀框**）——所以这一步就把"局部精确 + 远处压缩"放进同一个矩阵了。sink 偏置**不在这里**（它不是点积，是直接加在分数上的一项，见下）`
 				: `每个头算 Q_h·K_hᵀ 再除以 √${hd} 缩放，得到分数矩阵 S。K 就是滑窗里那 ${S} 个 token 的精确 KV（单头，K = V）。sink 偏置**不在这里**（它不是点积，是直接加在分数上的一项，见下）`,
 			formula: 'S_h=\\frac{Q_hK_h^{\\top}}{\\sqrt{d_h}}',
 			tensors: [
@@ -687,8 +708,9 @@ export function hybridTailSteps(
 						[R.head_dim, S + nE],
 						'head',
 						nE
-							? `← 转置之后：前 ${S} 列是窗口里的 token、后 ${nE} 列是压缩条目`
-							: '← 转置之后，每一列是一个 token 的 K'
+							? `← 转置之后：前 ${S} 列是每个 token 的精确 KV（**蓝框**）、后 ${nE} 列是压缩条目（**琥珀框**）`
+							: '← 转置之后，每一列是一个 token 的 K',
+						kvColBands
 					),
 					out: ref(
 						'S_h',
@@ -765,7 +787,8 @@ export function hybridTailSteps(
 							[cols, hd],
 							[cols, R.head_dim],
 							'cache',
-							`← 前 ${S + nE} 行 = K；末行 V = 0`
+							`← 前 ${S + nE} 行 = K（**蓝框** = 滑窗的精确 token、**琥珀框** = 压缩条目）；末行 V = 0`,
+							kvRowBands
 						),
 						result: ref(
 							'O_h',
@@ -847,7 +870,7 @@ export function hybridTailSteps(
 			id: `${prefix}-out-b`,
 			kind: 'CONCAT',
 			diagram: flow(['inv', 'out']),
-			label: `${G} 组各自的低秩结果拼起来，再过 W_O^B 回到 ${D} 维（真实 ${R.o_groups} × ${R.o_lora_rank} = ${R.o_groups * R.o_lora_rank} → ${R.d_model}）。为什么分组？每组只在自己那段里做低秩，参数比一个 ${H * hd}×${D} 的大矩阵少得多`,
+			label: `${G} 组各自的低秩结果拼起来，再过 W_O^B 回到 ${D} 维（真实 ${R.o_groups} × ${R.o_lora_rank} = ${R.o_groups * R.o_lora_rank} → ${R.d_model}）。每组只在自己那段里做低秩，参数比一个 ${H * hd}×${D} 的大矩阵少得多`,
 			formula:
 				'u=\\mathrm{Concat}\\!\\left(\\tilde o^{(1)},\\dots,\\tilde o^{(G)}\\right)W_O^B',
 			tensors: [

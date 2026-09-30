@@ -32,6 +32,13 @@ export interface Player {
 	seekRatio(r: number): void;
 	/** 直接跳到第 i 步的开头 */
 	seekStep(i: number): void;
+	/**
+	 * 跳到第 i 步内部的某个比例（`0..1`）。
+	 *
+	 * 页级"本页播放"接管过之后要**交还**控制权时用：先把总播放器挪到"现在显示的位置"，
+	 * 再交还——否则交还的瞬间画面会跳回总播放器原来停着的地方。
+	 */
+	seekStepRatio(i: number, r: number): void;
 	setSpeed(s: number): void;
 	restart(): void;
 	destroy(): void;
@@ -129,6 +136,12 @@ export function createPlayer(
 		seekStep(i) {
 			tl.pause();
 			tl.time(starts[Math.min(steps.length - 1, Math.max(0, i))]);
+		},
+		seekStepRatio(i, r) {
+			tl.pause();
+			const idx = Math.min(steps.length - 1, Math.max(0, i));
+			const dur = stepDurationMs(steps[idx]) / 1000;
+			tl.time(starts[idx] + Math.min(1, Math.max(0, r)) * dur);
 		},
 		setSpeed(s) {
 			tl.timeScale(s);

@@ -43,7 +43,14 @@ export interface TensorViewBase {
 	label?: string;
 	shape: number[];
 	/**
-	 * 布局：同一 `row` 的视图**横向并排**（如 Q·Kᵀ → mask → P·V 流水线）；
+	 * 格子边长提示（px）。不写就按视图类型兜底（矩阵乘 / 变换各有各的公式）。
+	 *
+	 * 用于把某一步的矩阵放大一些——比 `fillWidth`（占满整行）温和，是个定值。
+	 * **同一行的视图必须给同一个值**，否则并排的矩阵大小不一致、顶边对不齐
+	 * （如 `-compress-pool` 的 `w⊙v` / `v̄` / 归一化链三块要一起给）。
+	 */
+	cellSize?: number;
+	/** 布局：同一 `row` 的视图**横向并排**（如 Q·Kᵀ → mask → P·V 流水线）；
 	 * 不填则独占一行。
 	 */
 	row?: number;
@@ -60,6 +67,14 @@ export interface TensorViewBase {
 	 */
 	parallel?: boolean;
 	/**
+	 * 布局：同一 `row` 的多个视图**共用一个动画段，而且进度完全同步**（照样画 `→` 箭头）。
+	 *
+	 * 和 `parallel` 的区别：`parallel` 是"并行分支同时开算"，两边工作量不同时按工作量
+	 * **反比**缩放进度（小的先算完、然后空转等大的）；`sync` 是"两边的揭示必须**一一对上**"——
+	 * 如组内加权平均那一步：`w ⊙ v` 的**第 c 列**算完，右边的 `v̄` 才出现第 c 个数。
+	 */
+	sync?: boolean;
+	/**
 	 * 占满整行（跨过 `step.tensors` 那个自动填充网格的所有列）。
 	 *
 	 * 不 wide 的视图只拿到一格（约 220px）：一句长注解挤在那一格里会折成好几行，
@@ -67,9 +82,26 @@ export interface TensorViewBase {
 	 */
 	wide?: boolean;
 	/**
-	 * 在顶部"流程总览"里作为一个节点出现；值为显示名（如 `'P_h'`）。
-	 * 矩阵乘的操作数/结果会自动进总览，这个字段用于补充**单目运算**的产物
-	 * （如 softmax 之后的权重矩阵），从而让 `S_h → P_h` 也出现在流程里。
+	 * 这一行**放大到占满可用宽度**（目前只对 `matmul` / `transform` 生效）。
+	 *
+	 * 打开之后 `StepPanel` 会量出这一行的可用宽度，反推出一个"内容刚好占满"的格子边长，
+	 * 传给这一行的所有块；同时这一页的注解改成**占满各自矩阵的宽度**（见 `app.css`）。
+	 *
+	 * 刻意做成**逐视图开关**而不是全局规则：放大是"这一页正好有横向空间"的排版决定，
+	 * 别的页（格子密、块多）放大会溢出或者把页面拉得很长。用户只要求在
+	 * c128 的 gate 那一页这么做（"我只需要把 c128 的第 6 步的矩阵放大一些，占满页面宽度"）。
+	 */
+	fillWidth?: boolean;
+	/**
+	 * 在顶部"流程总览"里作为一个节点出现；值为显示名（如 `'v̄'`）。
+	 *
+	 * 矩阵乘 / 变换 / 拼接 / 求和 / 查表自带具名操作数，总览从 `a`/`b`/`out` 就能推出节点，
+	 * **不用填**。只有 `matrix` / `row` / `bars` / `ewise` 这几类"没有具名操作数"的视图需要它——
+	 * 总览把一步里**连续几个**声明了 `overview` 的视图按先后串成 `input → output`
+	 * （如组内加权平均的 `w ⊙ v → v̄`）。
+	 *
+	 * 一步里一个都不声明，这一步在总览里就会**整段消失**（不报错，只是不画）——
+	 * 所以新增这类视图时记得顺手补上（`verify` 有断言）。
 	 */
 	overview?: string;
 }
@@ -94,16 +126,71 @@ export interface RowView extends TensorViewBase {
 	labels?: string[];
 	/** 颜色归一化上限；不传则用该行的最大绝对值 */
 	scaleMax?: number;
+	/**
+	 * 是否按进度**逐个**揭示（第 i 个数在第 i 步算完时才出现）。
+	 *
+	 * 用在"这一行是由左边那块逐列算出来的"场合——如组内加权平均：`w ⊙ v` 的第 c 列
+	 * 算完，`v̄` 的第 c 个数才出现（配合 `sync` + `revealOrder: 'col'`）。
+	 */
+	animated?: boolean;
+	/**
+	 * 每多少个"揭示单位"才出一个数——就是**左边那块矩阵的行数**。
+	 * 见 `ValueRow` 的 `revealGroup`。
+	 */
+	revealGroup?: number;
 }
 
 /** 小矩阵热力图（仅用于 ≤16×16 这类真正需要看整体形态的矩阵，如注意力矩阵） */
 export interface MatrixView extends TensorViewBase {
 	kind: 'matrix';
 	data: Mat;
+	/**
+	 * 矩阵**显示名**（画在矩阵上方，和 `transform` / `matmul` 的表头同款）。
+	 *
+	 * `matrix` 视图的 `name` 是内部 id（如 `hca-pool-result`），不是给人看的名字；
+	 * 单独一个字段才能显示成 `v̄` 这种。放在同行、旁边都是有表头的矩阵时用
+	 * （如压缩器的结果矩阵 `v̄`）。
+	 */
+	title?: string;
 	/** 高亮的单元格 */
 	highlight?: [number, number];
-	/** 是否按行优先逐格揭示（用于 softmax 这类逐元素计算） */
+	/** 是否逐格揭示（用于 softmax 这类逐元素计算） */
 	animated?: boolean;
+	/**
+	 * 逐格揭示的**顺序**：默认 `'row'`（行优先，逐行扫过去）；
+	 * `'col'` 是**列优先**——一整列算完再走下一列。
+	 *
+	 * 用在"结果要按列归约"的场合：组内加权平均的 `w ⊙ v` 用 `'col'`，
+	 * 每列算完右边的 `v̄` 就出现对应的那个数（正在累加的那一列会整列加淡底）。
+	 */
+	revealOrder?: 'row' | 'col';
+	/**
+	 * 逐列揭示时**每多少个"揭示单位"算完一整列**（= 上游那个矩阵的行数）。
+	 *
+	 * 给"按列归约的结果"用：结果矩阵要**整列一起出现**（这一列加完了才轮到下一列），
+	 * 才能和上游"列算完"的时刻严格对上。换算式与 `ValueRow.revealGroup` 同一套。
+	 */
+	revealGroup?: number;
+	/**
+	 * **逐组揭示**：把行按 `groupRows` 行一组切开，一组一组地算（组内仍按列走）。
+	 *
+	 * 用在"整段序列分组压成若干条"的场合：8 个 token、一组 4 个 → **先算前 4 个得到第 1 条、
+	 * 再算后 4 个得到第 2 条**。
+	 *
+	 * 写在**结果**上时，换算式是"上游每算完一组的一列，我就出一格"
+	 * （`⌊round(reveal × 行 × 列 × groupRows) / groupRows⌋`，见 `MatrixGrid`）——
+	 * 这里 `groupRows` 与上游那个视图写的是**同一个数字**（"一组几行"）。
+	 */
+	groupRows?: number;
+	/**
+	 * 框出这一**段行** `[起始, 结束]`（闭区间）。
+	 *
+	 * 用在"整块矩阵都画出来，但只有其中几行参与这一步"的场合——
+	 * 如压缩器里"8 个 token 全画出来，框出的这 4 行才是这一条压缩条目看的窗口"。
+	 */
+	highlightRows?: [number, number];
+	/** 框出这几列（和 `highlightRows` 配合：如 `[v | s]` 里"打分那几列"） */
+	highlightCols?: number[];
 }
 
 export interface TilesView extends TensorViewBase {
@@ -126,8 +213,7 @@ export interface BarsView extends TensorViewBase {
 }
 
 /** 矩阵乘法中的一个操作数：可只带形状（大矩阵），也可带数据（小矩阵） */
-export interface MatRef {
-	name: string;
+export interface MatRef {	name: string;
 	label?: string;
 	shape: number[];
 	/** 有数据才能展示具体数值 */
@@ -157,6 +243,32 @@ export interface MatRef {
 	 * 总览里会把方框画成一条分段条，一眼看出两段的来源与比例。
 	 */
 	split?: { label: string; ratio: number; tone?: MatRef['tone'] }[];
+	/**
+	 * "真实尺寸"那行要不要**分段标注**——如 `[v | s]` 里"值占多少列、打分占多少列"。
+	 *
+	 * 为什么单独一个字段、不复用 `split`：`split` 的 label 带的是**缩放后**的列数（`'nope 3'`），
+	 * 而且它的比例**不一定等于真实比例**（MLA 的 nope/rope 缩放比是 3:2，真实是 448:64），
+	 * 从 `split` 反推真实列数会算出 307.2 这种假数字。所以要标注真实分段尺寸时显式给出。
+	 */
+	realParts?: { label: string; cols: number }[];
+	/**
+	 * **分组框**：把某一段行或列用浅色虚线框圈起来，用来区分"同一个矩阵里的两类东西"。
+	 *
+	 * 最典型的用法是 V4 混合注意力的 K / V：前 `S` 列（行）是**滑窗里的精确 token**、
+	 * 接着 `nE` 列（行）是**压缩条目**——同一块矩阵、两种来源，用不同浅色区分。
+	 * 颜色与文字的对应写在块的注解里（和 `highlightCols` 那套"框 + 注解"的用法一致）。
+	 */
+	bands?: MatrixBand[];
+}
+
+/** 矩阵里的一段分组框（见 `MatRef.bands`）：`from` / `to` 是**闭区间**的索引 */
+export interface MatrixBand {
+	/** 沿哪个方向分段 */
+	axis: 'row' | 'col';
+	from: number;
+	to: number;
+	/** 框的颜色（浅色；同一类东西在不同矩阵里用同一个颜色） */
+	tone: string;
 }
 
 /**
@@ -173,8 +285,53 @@ export interface MatmulView extends TensorViewBase {
 	out: MatRef;
 	/** 默认聚焦的输出元素 [i, j] */
 	focus?: [number, number];
+	/**
+	 * 框出**结果块**的这几列。
+	 *
+	 * 用在"结果是一块拼起来的东西、下一步只用其中几列"的场合——
+	 * 如 `[v | s]` 里"打分那几列"（下一步要拿它加 ape 做 softmax）。
+	 */
+	highlightCols?: number[];
 	/** 额外标量（如 1/√d_h），会显示在式子里 */
 	scaleNote?: string;
+}
+
+/**
+ * 逐元素二元运算视图：`out[i][j] = a[i][j] ⊙ b[i][j]`（两个操作数**同形状**）。
+ *
+ * 排布与 `MatmulView` 完全一样（`b` 右上、`a` 左下、`out` 右下），读法也照旧
+ * （横向 `a` → `out`、纵向 `b` → `out`）；区别只有一个：**没有 Σ**——
+ * 每个输出格只由两个**同位置**的输入格决定，所以高亮的是同一个格子，
+ * 算式框里也只有一项（不是 `Σ_p`）。
+ *
+ * 用在组内加权平均那一步：`w ⊙ v`——两个操作数都画出来
+ * （`v` 取自 `[v | s]` 的值那几列、`w` 就是上一步 softmax 的结果），
+ * 而不是只画一个"已经乘过权重"的结果矩阵。
+ */
+export interface EwiseView extends TensorViewBase {
+	kind: 'ewise';
+	a: MatRef;
+	b: MatRef;
+	out: MatRef;
+	/** 运算符符号，默认 `⊙` */
+	op?: string;
+	/** 框出**结果块**的这几行（闭区间）——如"这条压缩条目看的窗口那 4 行" */
+	highlightRows?: [number, number];
+	/** 框出**结果块**的这几列 */
+	highlightCols?: number[];
+	/**
+	 * 逐格揭示的顺序：默认行优先；`'col'` 是**列优先**（一整列算完再走下一列）。
+	 * 用在"结果要按列归约"的场合——列算完，右边的 `v̄` 才出对应的那个数。
+	 */
+	revealOrder?: 'row' | 'col';
+	/**
+	 * **逐组揭示**：行按 `groupRows` 行一组切开，一组一组地算（组内仍按列）。
+	 *
+	 * "整段序列压成若干条"时用：8 个 token、一组 4 个 → 先算前 4 个（第 1 条）、
+	 * 再算后 4 个（第 2 条）。框会跟着动画走：**框出的就是正在算的那一组**
+	 * （所以不用再手写 `highlightRows`）。
+	 */
+	groupRows?: number;
 }
 
 /**
@@ -241,6 +398,12 @@ export interface TransformView extends TensorViewBase {
 	kind: 'transform';
 	/** 输入矩阵（上一步的产物） */
 	input: MatRef;
+	/**
+	 * 输入块**不画**——它的内容由**同行左边**的另一块矩阵显示（如压缩器的 `-compress-pool`
+	 * 把 `-compress-kv` 并进来时，`v̄` 由 pool 的结果矩阵画，RMSNorm 的输入块就不重复画）。
+	 * 变换的节点 / 时长等逻辑照常使用 `input`（只是不渲染那一块）。
+	 */
+	hideInput?: boolean;
 	/** 输出矩阵 */
 	output: MatRef;
 	/** 运算名，如 'softmax' */
@@ -278,8 +441,7 @@ export interface TransformView extends TensorViewBase {
 	 *   `S ──softmax──▶ P_h ──×V──▶ O_h ──逆 RoPE──▶ O_h′`
 	 *
 	 * 一条链走完，`O_h′` 就贴在 `O_h` 右边。不这么写的话，`O_h` 得在下一行再当一次输入
-	 * 画出来——同一个矩阵在一页里出现两次、还挂着两个名字
-	 * （用户指出："我是指 O_h 旁边有一个 O_h′，放在同一行"）。
+	 * 画出来——同一个矩阵在一页里出现两次、还挂着两个名字。
 	 *
 	 * 只支持**逐行变换**，不支持矩阵乘：链尾再挂一个矩阵乘会多出两块，整行放不下。
 	 */
@@ -400,6 +562,7 @@ export type TensorView =
 	| TilesView
 	| BarsView
 	| MatmulView
+	| EwiseView
 	| MaskView
 	| ConcatView
 	| TransformView

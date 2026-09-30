@@ -65,6 +65,11 @@ export function refKey(ref: { name: string; handoffId?: string }): string {
  *   - 否则出**单目节点**；
  *   - 前面几段的运算名挂在节点的 `ops` 上（如 `掩码 → softmax` 标在 `O_h = P_h·V_h` 上方）；
  *   - 并行分支（一个 token 同时过多个专家）只画第一个 + `×N` 角标。
+ *
+ * `matrix` / `row` / `bars` / `ewise` 这几类视图**没有具名操作数**可画，
+ * 由视图自己在 `TensorViewBase.overview` 里声明"它在总览里叫什么"；连续几个这样的视图
+ * 按先后串成 `input → output`（如组内加权平均的 `w ⊙ v → v̄`）。
+ * 没声明 `overview` 的就不出节点——否则整步会静默消失。
  */
 export function buildOverviewItems(steps: Step[]): OverviewItem[] {
 	const items: OverviewItem[] = [];
@@ -148,11 +153,40 @@ export function buildOverviewItems(steps: Step[]): OverviewItem[] {
 					};
 					break;
 				}
-				case 'kvcache':
-					// 缓存结构不是一次运算，总览里不画节点（它在步骤列表里自有位置）
-					break;
 				default:
 					break;
+			}
+		}
+
+		// 上面只处理"自带具名操作数"的视图。`matrix` / `row` / `bars` / `ewise` 这几类没有
+		// 操作数可画，靠视图自己声明的 `overview` 显示名：这一步里第一个声明的是**输入**、
+		// 最后一个声明的是**输出**（如组内加权平均 `w ⊙ v → v̄`）。
+		//
+		// 合并页（`-compress-pool` 吞并了 `-compress-kv`）两者都有：链式视图（transform）
+		// 推出了节点（`v̄ → 压缩 KV`），而它的 input 正是 `overview` 声明的**最后一个**
+		// （`v̄`）——真正的起点是声明的第一个（`w ⊙ v`）。把节点输入换成它，总览里这一步
+		// 才从源头讲起（`w ⊙ v → 压缩 KV`，中间那段是这一页的细节）。
+		//
+		// 这里遍历**全部**张量而不是只遍历动画视图：命名"这一步产出了什么"的那一块
+		// 不一定是动画的那一块（CSA 的 `-indexer-topk`：动的是打分矩阵 `I`，
+		// 但"挑出了什么"由旁边那一行数值 `top-k` 说明）。
+		// 具名节点优先——已经推出节点时不再覆盖（`-compress-kv` 这类步骤两者都有）。
+		if (!node) {
+			const named = step.tensors.map(synthRef).filter((r): r is MatRef => !!r);
+			if (named.length >= 2) {
+				node = {
+					kind: 'unary',
+					id: `${step.id}:overview`,
+					stepId: step.id,
+					input: named[0],
+					output: named[named.length - 1],
+					ops: [...ops]
+				};
+			}
+		} else if (node.kind === 'unary') {
+			const named = step.tensors.map(synthRef).filter((r): r is MatRef => !!r);
+			if (named.length >= 2 && named[named.length - 1]?.name === node.input.name) {
+				node = { ...node, input: named[0] };
 			}
 		}
 
@@ -180,6 +214,24 @@ function isAnimatableView(t: TensorView): boolean {
 }
 
 /**
+ * 把"没有具名操作数"的视图（`matrix` / `row` / `bars` / `ewise`）合成一个总览用的 `MatRef`。
+ *
+ * 名字来自视图自己声明的 `TensorViewBase.overview`（如 `'w ⊙ v'`、`'v̄'`）。
+ * 没有声明就返回 `null`——那说明这一步本来就不该进总览，硬造一个名字只会画出
+ * 一个看不懂的方框。`data` 只是顺带带上（`MiniBox` 只画名字 + 尺寸）。
+ */
+function synthRef(t: TensorView): MatRef | null {
+	if (!t.overview) return null;
+	const data =
+		t.kind === 'matrix'
+			? t.data
+			: t.kind === 'row' || t.kind === 'bars'
+				? [t.data]
+				: undefined;
+	return { name: t.overview, shape: t.shape, label: t.label, data };
+}
+
+/**
  * 一个视图里所有"带 label 的矩阵引用"。
  *
  * 不同视图类型的挂载位置不同（矩阵乘是 a/b/out，变换是 input/output，拼接是 parts/result），
@@ -188,6 +240,8 @@ function isAnimatableView(t: TensorView): boolean {
 export function matRefsOf(t: TensorView): MatRef[] {
 	switch (t.kind) {
 		case 'matmul':
+			return [t.a, t.b, t.out];
+		case 'ewise':
 			return [t.a, t.b, t.out];
 		case 'transform':
 			return [

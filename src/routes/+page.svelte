@@ -238,7 +238,14 @@
 
 	<section class="stage">
 		{#if currentStep}
-			<StepPanel step={currentStep} progress={stepProgress} />
+			<!-- 页级 ▶ 是"接管"：先把底部总播放器停下，否则它下一帧就把控制权抢回去、画面跳一下；
+			     交还时把总播放器挪到"本页播到的位置"，交还的一瞬间也不会跳 -->
+			<StepPanel
+				step={currentStep}
+				progress={stepProgress}
+				onTakeOver={() => player?.pause()}
+				onHandBack={(r) => player?.seekStepRatio(stepIndex, r)}
+			/>
 		{:else if steps.length === 0}
 			<p class="loading">
 				四个阶段都关掉了。至少打开一个（见上方「展示阶段」），才有动画可看。

@@ -2,8 +2,8 @@
 	/**
 	 * 掩码过程动画。
 	 *
-	 * 按**行优先**顺序逐个处理格子：
-	 *   - 还没处理的格子：原值淡显（背景近白、文字浅灰）
+	 * 按**行**为单位依次处理（一行里该留哪些列、该屏蔽哪些列是一次定下来的）：
+	 *   - 还没处理的行：原值淡显（背景近白、文字浅灰）
 	 *   - 处理且保留（j ≤ i）：原值正常显示
 	 *   - 处理且屏蔽（j > i）：变成 −∞
 	 *
@@ -33,9 +33,18 @@ let {
 	const total = $derived(rows * cols);
 	const maxAbs = $derived(maxAbsOf(view.scores));
 
-	/** 已经处理到第几个格子（行优先） */
-	const done = $derived(Math.round(progress * total));
-	const currentIdx = $derived(Math.min(total - 1, done));
+	/**
+	 * 已经处理到第几行——**整行一起**处理（掩码的天然单位是一个 token 行：
+	 * "这一行该看哪些列"的因果 / 滑窗规则是一次定下来的）。
+	 * 一格一格地点过去会把整段播放拖得很慢（c128 的 `hca-attn` 掩码 88 格逐格点、
+	 * 一格 60ms 要 5 秒多），而且看不出"整行规则"；一行 11 格一起出才是
+	 * "一次算很多格子"。
+	 */
+	const doneRows = $derived(Math.min(rows, Math.round(progress * rows)));
+	/** 已处理的格子数（整行一起，所以一次跳 `cols` 个） */
+	const done = $derived(doneRows * cols);
+	/** 当前正在处理的那一行 */
+	const currentRow = $derived(Math.min(Math.max(0, rows - 1), doneRows));
 
 	const cellSize = $derived(cellSizeProp ?? (compact ? 24 : 34));
 	const w = $derived(cols * cellSize);
@@ -60,15 +69,17 @@ let {
 	<!-- bare：被别的视图（如 transform 的 preMask）嵌进去时只画矩阵，
 	     表头 / 计数 / 图例由外层负责，内边距也交给外层（否则会多出一层 padding 导致错位） -->
 	<div class="side">
-		{#if !bare}
-			<!-- 表头与 .src 行跟 transform / sum 视图保持同款，
-			     这样并步并排时矩阵顶边能对齐（少一行就会往上偏 ~27px） -->
-			<div class="head">
-				<span class="nm">{view.matrixName ?? view.name}</span>
-				<span class="sz">[{rows} × {cols}]</span>
-			</div>
-			<div class="src"><Emph text={view.label ?? '\u00a0'} /></div>
-		{/if}
+	{#if !bare}
+		<!-- 表头 + 两行注解跟 transform / matmul 保持同款，而且顺序也一样
+		     （名字 → 真实尺寸 → 来源 → 矩阵）：少一行并排时矩阵顶边就会偏。
+		     掩码视图没有 `MatRef`、拿不到真实尺寸，塞一个不换行空格占位。 -->
+		<div class="head">
+			<span class="nm">{view.matrixName ?? view.name}</span>
+			<span class="sz">[{rows} × {cols}]</span>
+		</div>
+		<div class="real">{'\u00a0'}</div>
+		<div class="src"><Emph text={view.label ?? '\u00a0'} /></div>
+	{/if}
 		<svg width={w} height={h} class="block">
 			{#each view.scores as row, i (i)}
 				{#each row as _v, j (j)}
@@ -107,12 +118,12 @@ let {
 				{/each}
 			{/each}
 
-			<!-- 当前正在处理的格子 -->
+			<!-- 当前正在处理的那一行（整行一起处理，高亮也跟着整行走） -->
 			{#if done < total}
 				<rect
-					x={(currentIdx % cols) * cellSize}
-					y={Math.floor(currentIdx / cols) * cellSize}
-					width={cellSize}
+					x="0"
+					y={currentRow * cellSize}
+					width={w}
 					height={cellSize}
 					fill="none"
 					stroke="#0f172a"

@@ -33,6 +33,8 @@
 	);
 
 	const cellSize = 24;
+	/** 列的宽度上限：**表那块的宽 + 1/4**（原则 ④）；最后一列不封顶、把剩下的全吃掉（原则 ⑤） */
+	const cap = $derived((view.table.shape[1] * cellSize * 5) / 4);
 </script>
 
 {#snippet head(ref: MatRef, accent = false)}
@@ -47,7 +49,7 @@
 	<div class="src"><Emph text={ref.label ?? '\u00a0'} /></div>
 {/snippet}
 
-<div class="lk">
+<div class="lk" style={`--cap:${cap}px;--last:1fr`}>
 	<div class="keys">
 		<span class="keys-title">{view.keyName ?? 'key'}</span>
 		{#each view.keys as k, i (i)}
@@ -122,9 +124,14 @@
 		color: #b45309;
 		font-weight: 700;
 	}
+	/* 列宽：下限是 `max-content`（装得下内容），上限才是 `--cap`（矩阵宽 + 1/4，原则 ④）——
+	   `--cap` 只限制"有富余时长多宽"，不会把宽过它的那一列压窄（见 `ConcatView` 里的说明）。
+	   最后一列 `1fr` 把剩下的全吃掉（原则 ⑤）。 */
 	.row {
 		display: grid;
-		grid-template-columns: auto auto auto;
+		grid-template-columns:
+			minmax(max-content, var(--cap, auto)) auto
+			minmax(max-content, var(--last, 1fr));
 		align-items: start;
 		justify-content: start;
 		column-gap: 0.8rem;

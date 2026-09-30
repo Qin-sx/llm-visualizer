@@ -48,6 +48,10 @@
 
 	// 链式相加要塞 4 列矩阵（项 / routed / shared / y），格子得小一号才排得进一行
 	const cellSize = $derived(compact || view.then ? 24 : 34);
+	/** 列的宽度上限：**最宽那块矩阵的宽 + 1/4**（原则 ④）；最后一列不封顶（原则 ⑤） */
+	const cap = $derived(
+		(Math.max(...view.terms.map((t) => t.shape[1] ?? 0), view.result.shape[1] ?? 0) * cellSize * 5) / 4
+	);
 	const hasWeights = $derived(!!view.weights);
 
 	/** 第 j 项在第 t 行的系数 */
@@ -70,10 +74,17 @@
 	</div>
 {/snippet}
 
-<div class="sm">
+<div class="sm" style={`--cap:${cap}px;--last:1fr`}>
 	<div class="row" class:chained={!!view.then}>
 		<div class="terms">
 			{#each view.terms as term, j (term.name)}
+				{#if j > 0}
+				<!--
+					两项是**各算各的**（不同专家各自的输出），这里只是把它们加起来——
+					中间画一条浅色虚线表示"断开"。
+				-->
+					<span class="tsep" aria-hidden="true"></span>
+				{/if}
 				<div class="side">
 					<div class="head">
 						<span class="nm">{term.name}</span>
@@ -174,9 +185,14 @@
 		flex-direction: column;
 		gap: 0.7rem;
 	}
+	/* 列宽：下限是 `max-content`（装得下内容），上限才是 `--cap`（矩阵宽 + 1/4，原则 ④）——
+	   `--cap` 只限制"有富余时长多宽"，不会把宽过它的那一列压窄（见 `ConcatView` 里的说明）。
+	   最后一列 `1fr` 把剩下的全吃掉（原则 ⑤）。 */
 	.row {
 		display: grid;
-		grid-template-columns: auto auto auto;
+		grid-template-columns:
+			minmax(max-content, var(--cap, auto)) auto
+			minmax(max-content, var(--last, 1fr));
 		align-items: center;
 		justify-content: start;
 		column-gap: 0.8rem;
@@ -195,7 +211,9 @@
 		+ 与 y 跨 1~3 行并居中 → 落在 routed 与 shared 之间。
 	*/
 	.row.chained {
-		grid-template-columns: auto auto auto auto auto;
+		grid-template-columns:
+			minmax(max-content, var(--cap, auto)) auto minmax(max-content, var(--cap, auto)) auto
+			minmax(max-content, var(--last, 1fr));
 		grid-template-rows: auto auto auto;
 		row-gap: 0.7rem;
 	}
@@ -225,6 +243,14 @@
 		display: flex;
 		flex-direction: column;
 		gap: 0.7rem;
+	}
+	/*
+	 * 两项之间的分隔虚线。只给 `border-top`、不给高度 → 元素高度就是那 1px 边框
+	 * （`box-sizing: border-box` 下 `height: 0` 会被边框撑到 1px，不如直接不写）。
+	 * 上下各留 `gap` 的间距，所以线是"浮"在两项中间的。
+	 */
+	.tsep {
+		border-top: 1px dashed #cbd5e1;
 	}
 	.mid,
 	.mid2 {

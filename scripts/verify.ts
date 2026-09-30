@@ -23,6 +23,9 @@ import {
 	MS_PER_CELL,
 	MIN_PHASE_MS,
 	MIN_TEXT_CELL,
+	isAnimatable,
+	MAX_TEXT_CELL,
+	fitCellSize,
 	matmulCellSize,
 	transformCellSize,
 	transformPhaseMs,
@@ -32,6 +35,7 @@ import {
 } from '../src/lib/core/steps';
 import { createPlayer } from '../src/lib/core/timeline';
 import { matmul, ropeApply, silu, softmaxRow } from '../src/lib/core/mat';
+import { realLabel } from '../src/lib/components/realShape';
 import { initWeights } from '../src/lib/model/init';
 import type { MhaTrace } from '../src/lib/slots/attention/mha';
 import type { MlaTrace } from '../src/lib/slots/attention/mla';
@@ -59,8 +63,9 @@ function assertCellSizes(steps: Step[], label: string) {
 	for (const step of steps) {
 		for (const t of step.tensors) {
 			if (t.kind === 'matmul') {
+				// 与 `MatmulView` 同一份判定：按 A/B/C 的**总列数**取预算（三块是左右排着的）
 				const size = matmulCellSize(
-					Math.max(t.out.shape[1] ?? 1, t.a.shape[1] ?? 1),
+					(t.a.shape[1] ?? 1) + (t.b.shape[1] ?? 1) + (t.out.shape[1] ?? 1),
 					t.row !== undefined
 				);
 				if (size < tightest) {
@@ -395,6 +400,34 @@ console.log('\n[尺寸硬约束]');
 assertCellSizes(demo.steps, 'MHA + MoE');
 assertRealShapes(demo.steps, 'MHA + MoE');
 assertFormulas(demo.steps, 'MHA + MoE');
+
+/**
+ * `fillWidth` 那一页放大格子用的 `fitCellSize`（纯函数，不依赖 DOM）。
+ *
+ * 渲染时 `StepPanel` 会量出这一行的可用宽度再迭代它；这里只钉住三条性质：
+ * **按比例放大、下限 `MIN_TEXT_CELL`、上限 `MAX_TEXT_CELL`**。
+ * 页面上的实际占满率靠无头 Chrome 量（`verify` 看不见 DOM）。
+ */
+{
+	// 内容 550 在 1100 里放得下 → 边长翻倍
+	assert(
+		fitCellSize(20, 550, 1100) === 40,
+		`fitCellSize：内容只占一半宽 → 格子边长翻倍（20 → ${fitCellSize(20, 550, 1100)}）`
+	);
+	// 内容比可用宽度还宽 → 一直缩到下限为止，不会再小
+	assert(
+		fitCellSize(20, 4400, 1100) === MIN_TEXT_CELL,
+		`fitCellSize：内容宽 4 倍 → 收到下限 ${MIN_TEXT_CELL}px`
+	);
+	// 内容很窄 → 一路放大到上限，不会无限涨
+	assert(
+		fitCellSize(20, 40, 1100) === MAX_TEXT_CELL,
+		`fitCellSize：内容很窄 → 放大到上限 ${MAX_TEXT_CELL}px`
+	);
+	// 量不到宽度时（SSR / 首帧）原样返回，不要把 0 传下去
+	assert(fitCellSize(34, 0, 1100) === 34, 'fitCellSize：量不到内容宽度时原样返回');
+	assert(fitCellSize(34, 500, 0) === 34, 'fitCellSize：量不到可用宽度时原样返回');
+}
 
 console.log('\n[Attention 形状]');
 assert(attn.q.length === CONFIG.num_heads, `Q 头数 = ${CONFIG.num_heads}`);
@@ -910,14 +943,20 @@ console.log('\n[每页/每段速度]');
 	const route = demo.steps.find((s) => s.id === 'moe-route')!;
 	const experts = demo.steps.find((s) => s.id === 'moe-experts')!;
 	assert(
-		stepDurationMs(experts) === stepDurationMs(route),
-		`并行页 moe-experts 与 moe-route 时长一致（${stepDurationMs(route)}ms）`
+		stepDurationMs(experts) <= stepDurationMs(route),
+		`并行页 moe-experts（${stepDurationMs(experts)}ms）不长于 moe-route（${stepDurationMs(route)}ms）——` +
+			`并行单元按工作量取最大格数，格数多的一侧时长更长`
 	);
-	const ratio = stepDurationMs(qProj) / stepDurationMs(route);
+	// 每格耗时一致：去掉下限的影响后，格子少的页与格子多的页各自"每格耗时"相等。
+	// 旧断言"只差 30% 以内"是旧下限 2400 把小页拉平的结果；降到 1200 后
+	// 24 格的 moe-route（1440ms）与 48 格的 attn-q（2880ms）就是格数比例，
+	// 每格仍是 MS_PER_CELL——这才是"页与页之间不忽快忽慢"的真正含义。
+	const routeWork = animationUnits(route).reduce((n, u) => n + Math.max(...u.map(workOf)), 0);
+	const qWork = animationUnits(qProj).reduce((n, u) => n + Math.max(...u.map(workOf)), 0);
 	assert(
-		ratio < 1.3,
-		`格子少的页与格子多的页时长只差 ${((ratio - 1) * 100).toFixed(0)}%` +
-			`（${stepDurationMs(route)}ms vs ${stepDurationMs(qProj)}ms）`
+		Math.abs(stepDurationMs(route) / routeWork - stepDurationMs(qProj) / qWork) < 1,
+		`每格耗时一致（moe-route ${stepDurationMs(route)}ms/${routeWork} 格 vs ` +
+			`attn-q ${stepDurationMs(qProj)}ms/${qWork} 格，每格应同为 ${MS_PER_CELL}ms）`
 	);
 	// 格子更多的链式页仍然更长（不是被拉平到一样）
 	const sumStep = demo.steps.find((s) => s.id === 'moe-shared-add')!;
@@ -934,7 +973,10 @@ console.log('\n[每页/每段速度]');
 		'每页时长 = Σ 各动画单元（单元内取最大值）'
 	);
 	const total = demo.steps.reduce((n, s) => n + stepDurationMs(s), 0);
-	assert(total < 50000, `整条流程 ${(total / 1000).toFixed(1)}s`);
+	// 上限是"整条流程连播下来别太久"的软约束。`then`（逐行）那一段改成**另起一段**之后
+	// （"要先算出 Y，才算得上对它做 op2"），每条流程会多出若干个 `MIN_PHASE_MS`——
+	// 这是有意换来的：宁可多两秒，也不要两块矩阵"同时"揭示。
+	assert(total < 60000, `整条流程 ${(total / 1000).toFixed(1)}s（< 60s）`);
 }
 
 console.log('\n[分段时长的结构]');
@@ -951,6 +993,12 @@ console.log('\n[分段时长的结构]');
 					`${s.id}/${t.name}：掩码段时长与 preMask 一致（${w.mask}ms）`
 				);
 				assert(w.rows > 0, `${s.id}/${t.name}：逐行段必须有时长（${w.rows}ms）`);
+				// 第二段是**逐行**（`then` 无 `b`）时它必须**另起一段**——`X ──op1──▶ Y ──op2──▶ Z`
+				// 里 Y、Z 是先后算的，挤在同一段一起揭示就成了"同时算出来"
+				assert(
+					t.then && !t.then.b ? w.rows2 > 0 : w.rows2 === 0,
+					`${s.id}/${t.name}：第二段逐行的时长与 then（无 b）一致（${w.rows2}ms）`
+				);
 				assert(
 					t.then?.b ? w.mm > 0 : w.mm === 0,
 					`${s.id}/${t.name}：矩阵乘段时长与 then.b 一致（${w.mm}ms）`
@@ -960,7 +1008,7 @@ console.log('\n[分段时长的结构]');
 					`${s.id}/${t.name}：链尾段时长与 tail 一致（${w.tail}ms）`
 				);
 				assert(
-					w.mask + w.rows + w.mm + w.tail === viewDurationMs(t),
+					w.mask + w.rows + w.rows2 + w.mm + w.tail === viewDurationMs(t),
 					`${s.id}/${t.name}：各段时长之和 = 视图时长（${viewDurationMs(t)}ms）`
 				);
 				// 链尾段（`tail`）必须**接在最后**：进度 0.99 时矩阵乘段还没播完就说不过去了
@@ -1040,6 +1088,99 @@ console.log('\n[播放器单步]');
 		'seekStep() 每一步都精确跳到位（含浮点边界那一步）'
 	);
 	player.destroy();
+
+	// 上面只走了一条流程（MHA+MoE）。**每一条流程都要走一遍**——V4 的三层步骤数不一样、
+	// 各步时长也不一样，某一层踩到边界不代表别的层没事。
+	const walkFlows: [string, LlmFlowResult][] = [
+		['MHA', buildLlmFlow({ modelId: 'r1', attnId: 'mha', ffnId: 'auto', layer: 0 })],
+		['MLA', buildLlmFlow({ modelId: 'r1', attnId: 'mla', ffnId: 'auto', layer: 0 })],
+		['V4-SWA', buildLlmFlow({ modelId: 'v4-flash', attnId: '', ffnId: 'auto', layer: 0 })],
+		['V4-CSA', buildLlmFlow({ modelId: 'v4-flash', attnId: '', ffnId: 'auto', layer: 2 })],
+		['V4-HCA', buildLlmFlow({ modelId: 'v4-flash', attnId: '', ffnId: 'auto', layer: 3 })]
+	];
+	for (const [label, d] of walkFlows) {
+		const zero = d.steps.filter((s) => stepDurationMs(s) <= 0).map((s) => s.id);
+		assert(
+			zero.length === 0,
+			`${label}：${d.steps.length} 步里没有"时长 0"的步骤（那种步骤时间轴跳不进去）${zero.length ? `：${zero.join(' ')}` : ''}`
+		);
+		const at: number[] = [];
+		const pl = createPlayer(d.steps, (p) => at.push(p.stepIndex));
+		pl.seekStep(d.steps.length - 1); // 先离开第一步，否则 seekStep(0) 不产生变化、不会被记录
+		at.length = 0;
+		for (let i = 0; i < d.steps.length; i++) pl.seekStep(i);
+		assert(
+			JSON.stringify(at) === JSON.stringify(d.steps.map((_, i) => i)),
+			`${label}：每一步都能被 seekStep 命中（${at.length} 步）`
+		);
+		// 从最后一步一路后退，每一步都要真的退回去
+		pl.seekStep(d.steps.length - 1);
+		const back: number[] = [];
+		for (let i = 0; i < d.steps.length - 1; i++) {
+			pl.prev();
+			back.push(at[at.length - 1]);
+		}
+		assert(
+			JSON.stringify(back) ===
+				JSON.stringify(
+					Array.from({ length: d.steps.length - 1 }, (_, i) => d.steps.length - 2 - i)
+				),
+			`${label}：从最后一步一路 prev() 能退到第一步（${back.length} 次）`
+		);
+		pl.destroy();
+	}
+
+	// 页级"本页播放"接管之后**交还**控制权靠 `seekStepRatio`：把总播放器挪到
+	// "现在显示到本页的哪个比例"，交还的一瞬间画面才不会跳回它原来停着的地方。
+	{
+		const d = walkFlows[walkFlows.length - 1][1];
+		const seen2: { i: number; r: number }[] = [];
+		const pl2 = createPlayer(d.steps, (p) => seen2.push({ i: p.stepIndex, r: p.stepProgress }));
+		for (const [i, r] of [
+			[3, 0.5],
+			[7, 0.25],
+			[7, 0.999]
+		] as const) {
+			seen2.length = 0;
+			pl2.seekStepRatio(i, r);
+			const last = seen2[seen2.length - 1];
+			assert(
+				last?.i === i && Math.abs(last.r - r) < 1e-3,
+				`seekStepRatio(${i}, ${r}) 落到第 ${last?.i} 步的 ${(last?.r ?? 0).toFixed(3)}`
+			);
+		}
+		pl2.destroy();
+	}
+
+	for (const [label, d] of walkFlows) {
+		const ovItems = buildOverviewItems(d.steps);
+		const animated = d.steps.filter((s) =>
+			s.tensors.some((t) => isAnimatable(t) && t.kind !== 'kvcache')
+		);
+		assert(
+			ovItems.length === animated.length,
+			`${label}：总览节点数 ${ovItems.length} = 有动画的步骤数 ${animated.length}`
+		);
+	}
+	{
+		// 组内加权平均那一步：`w ⊙ v → v̄`（两个压缩层型都该有）
+		for (const [label, id] of [
+			['V4-HCA', 'hca-compress-pool'],
+			['V4-CSA', 'csa-compress-pool']
+		] as const) {
+			const d = walkFlows.find(([l]) => l === label)![1];
+			const pool = buildOverviewItems(d.steps).find((it) => it.stepId === id);
+			assert(!!pool, `${label}：组内加权平均（\`-compress-pool\`）在总览里有节点`);
+		assert(
+			pool?.kind === 'unary' &&
+				pool.input.name === 'w ⊙ v' &&
+				pool.output.name.startsWith('压缩 KV'),
+			`${label}：该节点是 \`w ⊙ v → 压缩 KV\`（实际 ${
+				pool?.kind === 'unary' ? `${pool.input.name} → ${pool.output.name}` : '—'
+			}）`
+		);
+		}
+	}
 }
 
 console.log('\n[并行动画：每格耗时一致]');
@@ -2013,7 +2154,7 @@ console.log('\n[DeepSeek V4 混合注意力：SWA / CSA / HCA]');
 
 	// ── 逆 RoPE 挂在链尾（`tail`），`O_h′` 就在 `O_h` 右边 ──────────
 	// 为什么单独查：把逆 RoPE 拆成独立视图也能算对（数值断言照样绿），
-	// 但页面上 `O_h` 会被画两次、还挂两个名字——用户要的是"O_h 旁边有一个 O_h′"。
+	// 但页面上 `O_h` 会被画两次、还挂两个名字。
 	{
 		const attnStep = swaDemo.steps.find((s) => s.id.endsWith('-attn'))!;
 		const chain = attnStep.tensors.find((t) => t.kind === 'transform')!;
@@ -2044,11 +2185,379 @@ console.log('\n[DeepSeek V4 混合注意力：SWA / CSA / HCA]');
 		}
 	}
 
+	// ── K / V 上的"分组框"：滑窗（精确 token）与压缩条目用**不同浅色**框出来 ──
+	// K 按**列**分段、V 按**行**分段（两者都是"位置"那一维），段边界 = S；
+	// 颜色在 K / V 上必须一致，否则读者认不出"哪一段是哪一类"。纯滑窗层没有第二段，不画框。
+	{
+		// 注意 `endsWith('-score')` 会先撞上 CSA 的 `csa-indexer-score`（indexer 的打分），
+		// 所以这里按**完整 id** 找那两步
+		const scoreStep = hcaDemo.steps.find((s) => s.id === 'hca-score')!;
+		const attnStep = hcaDemo.steps.find((s) => s.id === 'hca-attn')!;
+		const kB = scoreStep.tensors.find((t) => t.kind === 'matmul' && t.b.name === 'K_hᵀ');
+		const vB = attnStep.tensors.find(
+			(t) => t.kind === 'transform' && t.then?.b.name === 'V'
+		);
+		const kRef = kB?.kind === 'matmul' ? kB.b : undefined;
+		const vRef = vB?.kind === 'transform' ? vB.then!.b : undefined;
+		const nE = (hcaDemo.trace.layers[3].attention as HybridTrace).nE;
+		const desc = (r?: { bands?: { axis: string; from: number; to: number; tone: string }[] }) =>
+			(r?.bands ?? []).map((b) => `${b.axis}:${b.from}-${b.to}@${b.tone}`).join(' ');
+		assert(
+			desc(kRef) === `col:0-${S - 1}@#38bdf8 col:${S}-${S + nE - 1}@#fbbf24`,
+			`V4 HCA：K_hᵀ 的列分成"滑窗（前 ${S} 列）"与"压缩（后 ${nE} 列）"两个浅色框（实际 ${desc(kRef)}）`
+		);
+		assert(
+			desc(vRef) === `row:0-${S - 1}@#38bdf8 row:${S}-${S + nE - 1}@#fbbf24`,
+			`V4 HCA：V 的行分成两段同色的框，末行 sink 不框（实际 ${desc(vRef)}）`
+		);
+		// 颜色必须一一对应：蓝 = 滑窗、琥珀 = 压缩
+		const toneOf = (r?: { bands?: { from: number; tone: string }[] }, from = 0) =>
+			r?.bands?.find((b) => b.from === from)?.tone;
+		assert(
+			toneOf(kRef) === toneOf(vRef) && toneOf(kRef, S) === toneOf(vRef, S),
+			'V4 HCA：K 与 V 上"同一类东西"用的是同一个颜色（蓝 = 滑窗、琥珀 = 压缩）'
+		);
+		// CSA 也有两段（压缩比不同、条目数不同）；纯滑窗层只有一段，不画框
+		const csaScore = csaDemo.steps.find((s) => s.id === 'csa-score')!;
+		const csaK = csaScore.tensors.find((t) => t.kind === 'matmul' && t.b.name === 'K_hᵀ');
+		assert(
+			(csaK?.kind === 'matmul' ? csaK.b.bands?.length : 0) === 2,
+			'V4 CSA：K 上同样有两段框（压缩比不同不影响"分两段"这件事）'
+		);
+		const swaScore = swaDemo.steps.find((s) => s.id === 'swa-score')!;
+		const swaK = swaScore.tensors.find((t) => t.kind === 'matmul' && t.b.name === 'K_hᵀ');
+		assert(
+			(swaK?.kind === 'matmul' ? swaK.b.bands : undefined) === undefined,
+			'V4 SWA：纯滑窗层只有一段，不画分组框（没有可区分的东西）'
+		);
+	}
+
 	// ── 压缩器（CSA：重叠窗口 + indexer） ────────
 	console.log('    CSA（2 倍压缩（真实 4）+ 重叠窗口 + indexer）：');
 	const cs = csaDemo.trace.layers[2].attention as HybridTrace;
 	const cg = cs.compress!.groups;
+
+	// gate 投影必须是**真正的矩阵乘**：`W_gate` 得作为 B 画出来。
+	// 为什么单独查：写成 `transform`（`× W_gate` 只出现在箭头上）时，A/B/C 的数值断言
+	// 一条都不会红——矩阵根本没画，页面上看不出来。
+	{
+		const gateStep = csaDemo.steps.find((s) => s.id.endsWith('-compress-gate'))!;
+		const gate = gateStep.tensors.find((t) => t.kind === 'matmul');
+		assert(
+			!!gate && gate.kind === 'matmul' && gate.b.name === 'W_gate',
+			'gate 投影用矩阵乘视图，`W_gate` 作为 B 画出来（不是只在箭头里写个 `× W_gate`）'
+		);
+		if (gate?.kind === 'matmul') {
+			assert(
+				gateStep.tensors.filter((t) => t.kind === 'matmul').length === 1,
+				'这一步只有一个矩阵乘视图'
+			);
+			// 画出来的 A/B/C 必须真的满足 A·B = C——否则"画了 W_gate"也可能画的是别的矩阵
+			const A = gate.a.data ?? [];
+			const B = gate.b.data ?? [];
+			const C = gate.out.data ?? [];
+			let ok = A.length > 0 && B.length > 0 && C.length > 0;
+			for (let i = 0; ok && i < C.length; i++)
+				for (let j = 0; ok && j < C[i].length; j++) {
+					let acc = 0;
+					for (let p = 0; p < A[i].length; p++) acc += A[i][p] * (B[p]?.[j] ?? 0);
+					if (Math.abs(acc - C[i][j]) > 1e-12) ok = false;
+				}
+			assert(ok, '页面上画的 X · W_gate = [v | s] 真的成立（画出来的就是乘的那个矩阵）');
+		}
+		// `[v | s]` 是一块矩阵，光看 `[8 × 1024]` 看不出"值占多少、打分占多少"——
+		// 而这一步的关键正是"打分算权重、值被平均"。所以注解里必须写出真实的分段尺寸。
+		for (const [name, d] of [
+			['CSA', csaDemo],
+			['HCA', hcaDemo]
+		] as const) {
+			const gateStep = d.steps.find((s) => s.id.endsWith('-compress-gate'))!;
+			const g = gateStep.tensors.find((t) => t.kind === 'matmul');
+			const out = g?.kind === 'matmul' ? g.out : undefined;
+			const realTotal = out?.realShape?.[1] ?? 0;
+			const stepText = gateStep.label;
+			assert(
+				stepText.includes(`值 ${realTotal / 2} 列`) &&
+					stepText.includes(`打分 ${realTotal / 2} 列`) &&
+					stepText.includes(`合计 ${realTotal}`),
+				`V4 ${name}：gate 那一步的文案写出了值 / 打分各自在真实里的列数（各 ${realTotal / 2}）与合计 ${realTotal}`
+			);
+			// "真实尺寸"那一行也要分段标出来（绿色胶囊是 nowrap + ellipsis，长句子会被截掉，
+			// 所以分段尺寸走这一行，不走胶囊）
+			const realLine = out ? (realLabel(out) ?? '') : '';
+			assert(
+				realLine.includes('值 512 列') && realLine.includes('打分 512 列'),
+				`V4 ${name}：\`[v | s]\` 的"真实尺寸"行分段标出了值 / 打分各占多少列（${realLine}）`
+			);
+		}
+	}
+
 	assert(cs.nE === 4, `2 倍压缩（真实 4）：${S} 个 token 压出 ${cs.nE} 条压缩条目`);
+
+	// ── 压缩的前两步：权重从哪来（gate 页） + 怎么用权重（pool 页） ──
+	// gate 页：`W_gate` 画成矩阵乘、`[v | s]` 标真实分段尺寸、打分加 ape 再 softmax
+	// 和 gate 投影同一页、且和 `ape` 排在同一行（三块各 hd 列）；
+	// pool 页只留"用权重把值加权平均"，且别把窗口里的 token 拆成好几块。
+	console.log('    压缩：权重从哪来 / 怎么用：');
+	for (const [name, d, layer, ratio, overlap] of [
+		['CSA', csaDemo, 2, plan2, true],
+		['HCA', hcaDemo, 3, plan4, false]
+	] as const) {
+		const gateStep = d.steps.find((s) => s.id.endsWith('-compress-gate'))!;
+		const poolStep = d.steps.find((s) => s.id.endsWith('-compress-pool'))!;
+		const comp = (d.trace.layers[layer].attention as HybridTrace).compress!;
+		const grp = comp.groups[comp.groups.length - 1]; // 页面上举的例子：最后一条
+
+		// ① gate 页：投影 → 框出打分那几列 → 加 ape → softmax，**全在同一页**
+		const mm = gateStep.tensors.find((t) => t.kind === 'matmul');
+		assert(
+			!!mm && mm.kind === 'matmul' && mm.b.name === 'W_gate' && !!mm.highlightCols?.length,
+			`V4 ${name}：gate 页把 \`W_gate\` 画成矩阵乘，并在结果 \`[v | s]\` 上**框出打分那几列**`
+		);
+		const chain = gateStep.tensors.find((t) => t.name.endsWith('-gate-softmax'));
+		assert(
+			!!chain && chain.kind === 'transform' && chain.input.name === 'ape' && chain.output.name === 's+ape',
+			`V4 ${name}：同一页里跟着 \`ape ──+ s──▶ s + ape\`（"权重从哪来"就在眼前，不拆到下一页）`
+		);
+		// "放大占满宽度"是**逐页开关**，只给 HCA 开：重叠窗口（CSA）那一行 gate 输出有 16 列、
+		// 本来就挤满，放大只会溢出——所以这条规则不能做成全局的。
+		const fills = !!mm?.fillWidth && !!chain?.fillWidth;
+		assert(
+			fills === !overlap,
+			`V4 ${name}：gate 页"放大到占满可用宽度"${overlap ? '不开' : '开'}（fillWidth=${fills}）`
+		);
+		if (chain?.kind === 'transform') {
+			assert(
+				chain.input.shape[1] === hd && chain.output.shape[1] === hd && chain.then?.result.shape[1] === hd,
+				`V4 ${name}：ape / s + ape / w 三块各只有 ${hd} 列（一行排得下）`
+			);
+			// **8 个 token 一起画**（不是只切窗口那 4 行）
+			assert(
+				chain.input.shape[0] === S &&
+					chain.output.shape[0] === S &&
+					chain.then?.result.shape[0] === S,
+				`V4 ${name}：ape / s + ape / w 都是 ${S} 行——整个序列一起画，不切窗口那 ${grp.slots.length} 行`
+			);
+			// 8 行里"这一组自己那几个 token"的行，必须正好等于窗口那 ${window} 行里对应槽位的值
+			const ownSlotOf = (t: number) => (overlap ? ratio : 0) + (t % ratio);
+			const out8 = chain.output.data ?? [];
+			const w8 = chain.then?.result.data ?? [];
+			let tie = out8.length === S && w8.length === S;
+			for (let t = ratio * grp.index; tie && t < ratio * (grp.index + 1); t++) {
+				const slot = ownSlotOf(t);
+				for (let c = 0; tie && c < hd; c++) {
+					if (Math.abs((out8[t]?.[c] ?? 0) - grp.scores[slot][c]) > 1e-15) tie = false;
+					if (Math.abs((w8[t]?.[c] ?? 0) - grp.weights[slot][c]) > 1e-15) tie = false;
+				}
+			}
+			assert(
+				tie,
+				`V4 ${name}：8 行里"这一组自己那几个 token"的行 = 窗口那 ${grp.slots.length} 行对应槽位的 \`s + ape\` / \`w\`（同一份数据）`
+			);
+			assert(
+				chain.then?.op.includes('softmax'),
+				`V4 ${name}：链尾是 softmax（逐通道）——打分加完 ape 立刻归一化`
+			);
+		}
+		// softmax 只该出现在 gate 页
+		assert(
+			!poolStep.tensors.some((t) => t.name.includes('softmax') || t.name.includes('source')),
+			`V4 ${name}：pool 页不再重复画 \`[v | s]\` 和 softmax（那两块已经并进 gate 页了）`
+		);
+		// 矩阵乘与打分链**并排一行**（`row` 相同、`group` 不同 → 渲染成 `.hrow`）
+		assert(
+			mm?.row !== undefined && mm.row === chain?.row && mm.group !== chain?.group,
+			`V4 ${name}：矩阵乘与 \`ape ──+ s──▶ s+ape ──softmax──▶ w\` **并排一行**（共用 row=${mm?.row}）`
+		);
+		// `s + ape` 与 softmax 必须**先后**算：`then`（逐行）要另起一段
+		if (chain?.kind === 'transform') {
+			const w = transformPhaseMs(chain);
+			assert(
+				w.rows > 0 && w.rows2 > 0,
+				`V4 ${name}：\`s + ape\` 与 softmax **分两段先后**算（${w.rows}ms → ${w.rows2}ms）`
+			);
+		}
+
+		// ② pool 页：只用权重 —— `w ⊙ v` 一块 + 箭头 + 一行 v̄
+		//
+		// 不重叠（HCA）用 `ewise`：`w` 与 `v` 都从上一页的完整矩阵拷过来、画成和矩阵乘同一个 2×2，
+		// **8 个 token 全画**，框出这条条目看的窗口那几行。
+		// 重叠窗口（CSA）下同一个 token 在两条窗口里权重不同，逐 token 的 8 行加起来不等于 v̄，
+		// 所以那边保持"窗口那 window 行"的 `matrix` 写法。
+		const prod = poolStep.tensors.find(
+			(t) => t.name.endsWith('-pool-prod') || t.name.endsWith('-pool-ewise')
+		);
+		const result = poolStep.tensors.find((t) => t.name.endsWith('-pool-result'));
+		const grpN = grp.slots.length;
+
+		if (overlap) {
+			assert(
+				!!prod && prod.kind === 'matrix' && prod.data.length === grpN,
+				`V4 ${name}：\`w ⊙ v\` 画成一个 ${grpN} 行的矩阵（不是把 ${grpN} 个 token 拆成 ${grpN} 块）`
+			);
+			if (prod?.kind === 'matrix') {
+				let same = true;
+				for (let j = 0; same && j < grp.values.length; j++)
+					for (let c = 0; same && c < hd; c++)
+						if (Math.abs((prod.data[j][c] ?? 0) - grp.values[j][c] * grp.weights[j][c]) > 1e-15)
+							same = false;
+				assert(same, `V4 ${name}：\`w ⊙ v\` 逐元素 = 权重 × 值`);
+				let colOk = true;
+				for (let c = 0; colOk && c < hd; c++) {
+					const acc = prod.data.reduce((s2, row) => s2 + row[c], 0);
+					if (Math.abs(acc - grp.pooled[c]) > 1e-12) colOk = false;
+				}
+				assert(colOk, `V4 ${name}：把 \`w ⊙ v\` 按列加起来 = v̄（${grpN} 行 → 1 条压缩条目）`);
+			}
+		} else {
+			assert(
+				!!prod && prod.kind === 'ewise' && prod.op === '⊙',
+				`V4 ${name}：\`w ⊙ v\` 用**逐元素**视图画（两个操作数都画出来，不是只画"已经乘过权重"的结果）`
+			);
+			if (prod?.kind === 'ewise') {
+				// 两个操作数**就是**上一步那两块（同一个对象 = "从上一步的完整矩阵拷贝过来"）
+				const chainW = gateStep.tensors.find((t) => t.name.endsWith('-gate-softmax'));
+				const wData = chainW?.kind === 'transform' ? chainW.then?.result.data : undefined;
+				const comp = (d.trace as HybridTrace).layers[layer].attention.compress!;
+				assert(
+					prod.a.name === 'v' && prod.a.data === comp.v,
+					`V4 ${name}：左操作数 \`v\` 就是上一步 \`[v | s]\` 的值那几列（同一个矩阵对象）`
+				);
+				assert(
+					prod.b.name === 'w' && !!wData && prod.b.data === wData,
+					`V4 ${name}：右操作数 \`w\` 就是上一步 softmax 出来的权重（同一个矩阵对象）`
+				);
+				// 8 个 token 全画（不是只画窗口那 4 行）
+				assert(
+					prod.out.shape[0] === S && prod.a.shape[0] === S && prod.b.shape[0] === S,
+					`V4 ${name}：\`w\` / \`v\` / \`w ⊙ v\` 都是 ${S} 行——8 个 token 全画（原来只有窗口那 ${grpN} 行）`
+				);
+				// **逐组揭示**：8 个 token 分成 2 组，框跟着动画走（不再写死"举例那一组"）
+				assert(
+					prod.groupRows === plan4,
+					`V4 ${name}：\`w ⊙ v\` 逐组揭示、一组 ${plan4} 行（实际 ${prod.groupRows}）`
+				);
+				assert(
+					prod.highlightRows === undefined,
+					`V4 ${name}：框不写死（原来固定框最后那一组当例子）——现在框"正在算的那一组"`
+				);
+				// 逐元素 = 两个同位置的格子相乘
+				let same = true;
+				for (let t = 0; same && t < S; t++)
+					for (let c = 0; same && c < hd; c++)
+						if (
+							Math.abs((prod.out.data![t][c] ?? 0) - prod.a.data![t][c] * prod.b.data![t][c]) >
+							1e-15
+						)
+							same = false;
+				assert(same, `V4 ${name}：\`w ⊙ v\` 逐元素 = \`v\` × \`w\`（同位置的格子）`);
+				// 每一组的那几行按列加起来 = 对应那一条（页面上是"先算第 1 组、再算第 2 组"）
+				let allGroupsOk = true;
+				for (const gr of comp.groups) {
+					for (let c = 0; allGroupsOk && c < hd; c++) {
+						let acc = 0;
+						for (let t = gr.from; t <= Math.min(gr.to - 1, S - 1); t++) acc += prod.out.data![t][c];
+						if (Math.abs(acc - gr.pooled[c]) > 1e-12) allGroupsOk = false;
+					}
+				}
+				assert(
+					allGroupsOk,
+					`V4 ${name}：每一组的 ${plan4} 行按列加起来 = 那一条压缩条目（两组分别得到第 1、2 条）`
+				);
+			}
+		}
+
+		// 结果块：**整段序列压出的全部条目**（不是只拿一条举例），画成 `[nE × hd]` 的小矩阵，
+		// 逐格跟着上游出现。
+		const allEntries = (d.trace as HybridTrace).layers[layer].attention.compress!.entries;
+		const nEnt = allEntries.length;
+		assert(
+			!!result && result.kind === 'matrix' && result.data === allEntries,
+			`V4 ${name}：结果画成**全部 ${nEnt} 条**压缩条目（${nEnt} × ${hd}，就是后面 ${nEnt} 条压缩 KV），不是只拿一条举例`
+		);
+		if (!overlap) {
+			// HCA：上游一组一行地出结果（先出完第 1 条、再第 2 条），所以**不写死框**、
+			// 也不用"整列一起出现"那套（`revealGroup`）
+			assert(
+				result?.kind === 'matrix' &&
+					result.groupRows === plan4 &&
+					result.revealGroup === undefined &&
+					result.revealOrder !== 'col' &&
+					result.highlightRows === undefined,
+				`V4 ${name}：结果逐格跟着上游出现（先出完第 1 条再第 2 条），不写死框`
+			);
+		} else {
+			assert(
+				result?.kind === 'matrix' &&
+					result.highlightRows?.[0] === nEnt - 1 &&
+					result.highlightRows?.[1] === nEnt - 1,
+				`V4 ${name}：框出的是这一页举例的那一条（第 ${nEnt} 条）`
+			);
+		}
+		// 每一组按列加出来 = 对应的那一条（逐条对上，不只是举例那条）
+		assert(
+			result?.kind === 'matrix' &&
+				comp.groups.every((gr, e) =>
+					allEntries[e].every((v, c) => Math.abs(v - gr.pooled[c]) < 1e-12)
+				),
+			`V4 ${name}：结果里第 e 条就是上面第 e 组按列加出来的那一条`
+		);
+		assert(
+			prod?.row !== undefined && prod.row === result?.row && !prod.parallel,
+			`V4 ${name}：\`w ⊙ v\` 与结果排在同一行（中间画 →），而不是上下堆着`
+		);
+		// 相加的过程要**看得见**：`w ⊙ v` 按列揭示，一整列算完结果才出对应的那一格。
+		// 两边必须**同一个进度**（`sync`）而且换算式对得上，否则会"列还没算完数就冒出来"。
+		assert(
+			(prod?.kind === 'matrix' || prod?.kind === 'ewise') &&
+				prod.revealOrder === 'col' &&
+				(prod.kind === 'ewise' || !!prod.animated),
+			`V4 ${name}：\`w ⊙ v\` **按列**逐格揭示（\`Σ_j\` 是沿着列加的）`
+		);
+		if (!overlap) {
+			assert(
+				!!prod?.sync && !!result?.sync && !!result.animated && result.groupRows === plan4,
+				`V4 ${name}：\`w ⊙ v\` 与结果共用同一段进度，且"每算完一组的一列就出一格"对得上`
+			);
+		} else {
+			// 重叠窗口版：上游只画窗口那 `window` 行，结果**整列一起出现**
+			assert(
+				!!prod?.sync && !!result?.sync && !!result.animated && result.revealGroup === grpN,
+				`V4 ${name}：\`w ⊙ v\` 与结果共用同一段进度，且"每 ${grpN} 格算完一整列"对得上`
+			);
+		}
+		assert(
+			isAnimatable(prod!) && isAnimatable(result!),
+			`V4 ${name}：\`w ⊙ v\` 与结果都是可动画视图（结果原来一上来就整行显示完了）`
+		);
+		{
+			// 严格同步：`reveal` 取遍 0..1，两边"算完的揭示单位数"必须始终相等。
+			// HCA（逐组）：揭示单位 = "一组的一列"（`plan4` 格）→ 结果出 1 格；
+			// CSA（重叠窗口）：揭示单位 = "一整列"（`grpN` 格）→ 结果出 `nEnt` 格（整列一起亮）。
+			const per = overlap ? grpN : plan4;
+			const perResult = overlap ? nEnt : 1;
+			let sync = true;
+			let worst = '';
+			for (let k = 0; k <= 100; k++) {
+				const rv = k / 100;
+				const done = Math.round(rv * (overlap ? grpN : S) * hd); // 左边揭示了几格
+				const units = Math.floor(done / per); // 算完几个揭示单位
+				const shown = overlap
+					? Math.floor(Math.round(rv * hd * grpN) / grpN) * nEnt // 整列一起亮
+					: Math.floor(Math.round(rv * nEnt * hd * plan4) / plan4); // 逐格跟着出现
+				if (shown !== units * perResult) {
+					sync = false;
+					worst = `reveal=${rv}：算完 ${units} 个单位（应出 ${units * perResult} 格）但出了 ${shown} 格`;
+					break;
+				}
+			}
+			assert(
+				sync,
+				`V4 ${name}：整段进度上"算完的揭示单位数"与"结果出现的格数"始终相等${worst ? '（' + worst + '）' : ''}`
+			);
+		}
+	}
+
 	assert(
 		cg.every((g) => g.slots.length === plan2 * 2),
 		`重叠窗口：每条压缩条目看 ${plan2 * 2} 个 token = 上一组 ${plan2} 个 + 自己 ${plan2} 个`
