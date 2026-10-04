@@ -195,7 +195,12 @@ function assertNoDuplicateMatrices(steps: Step[], label: string) {
 	for (const s of steps) {
 		const count = new Map<string, number>();
 		for (const t of s.tensors) {
-			for (const ref of matRefsOf(t)) count.set(ref.name, (count.get(ref.name) ?? 0) + 1);
+			for (const ref of matRefsOf(t)) {
+				// `hideInput: true` 的变换：输入由同一步里别的视图画（如矩阵乘的 C），
+				// 这里不重画，所以不参与"同一个矩阵画两次"的计数
+				if (t.kind === 'transform' && t.hideInput && ref === t.input) continue;
+				count.set(ref.name, (count.get(ref.name) ?? 0) + 1);
+			}
 		}
 		const bad = [...count.entries()].filter(([, n]) => n > 1);
 		if (bad.length) offenders.push(`${s.id}(${bad.map(([k, n]) => `${k}×${n}`).join(',')})`);
@@ -1977,8 +1982,6 @@ console.log('\n[DeepSeek V4 混合注意力：SWA / CSA / HCA]');
 	);
 
 	// ── 页内排布 / 两条 RoPE 页的统一格式 ────────────
-	// 为什么单独查：这些块上下堆着、或把 RoPE 拆成独立"rope 段"小块，数值上完全正确，
-	// 只是读起来不是那个意思。
 	console.log('    页内排布：');
 	{
 		const attnSteps = swaDemo.steps.filter((s) => s.id.startsWith('swa-'));
@@ -1994,7 +1997,6 @@ console.log('\n[DeepSeek V4 混合注意力：SWA / CSA / HCA]');
 			`升维页只剩"归一化 → 升维"一条链 + 一行小字（${qUp.tensors.length} 块）；新页一条链 + 一行小字（${qNorm.tensors.length} 块）`
 		);
 
-		// 第 4 页（Q 归一化 + RoPE）与第 5 页（KV 归一化 + RoPE）**同一个格式**：
 		// 一条 `transform`（整块矩阵），RoPE 挂在**链尾**，末尾 dr 维在链尾段才被框出来。
 		const ropePages = ['swa-q-norm-rope', 'swa-kv-norm-rope'] as const;
 		const lastCol = Array.from({ length: dr }, (_, i) => dn + i).join(',');
@@ -2153,8 +2155,6 @@ console.log('\n[DeepSeek V4 混合注意力：SWA / CSA / HCA]');
 	);
 
 	// ── 逆 RoPE 挂在链尾（`tail`），`O_h′` 就在 `O_h` 右边 ──────────
-	// 为什么单独查：把逆 RoPE 拆成独立视图也能算对（数值断言照样绿），
-	// 但页面上 `O_h` 会被画两次、还挂两个名字。
 	{
 		const attnStep = swaDemo.steps.find((s) => s.id.endsWith('-attn'))!;
 		const chain = attnStep.tensors.find((t) => t.kind === 'transform')!;
@@ -2238,8 +2238,6 @@ console.log('\n[DeepSeek V4 混合注意力：SWA / CSA / HCA]');
 	const cg = cs.compress!.groups;
 
 	// gate 投影必须是**真正的矩阵乘**：`W_gate` 得作为 B 画出来。
-	// 为什么单独查：写成 `transform`（`× W_gate` 只出现在箭头上）时，A/B/C 的数值断言
-	// 一条都不会红——矩阵根本没画，页面上看不出来。
 	{
 		const gateStep = csaDemo.steps.find((s) => s.id.endsWith('-compress-gate'))!;
 		const gate = gateStep.tensors.find((t) => t.kind === 'matmul');
@@ -2285,8 +2283,16 @@ console.log('\n[DeepSeek V4 混合注意力：SWA / CSA / HCA]');
 			// "真实尺寸"那一行也要分段标出来（绿色胶囊是 nowrap + ellipsis，长句子会被截掉，
 			// 所以分段尺寸走这一行，不走胶囊）
 			const realLine = out ? (realLabel(out) ?? '') : '';
+			// CSA（重叠窗口）分段名是 dsv4 的英文（v_overlap / v / s_overlap / s），
+			// HCA（不重叠）是中文（值 / 打分）——各按各的查。
+			const segOk = name === 'CSA'
+				? realLine.includes('v_overlap 512 列') &&
+					realLine.includes('v 512 列') &&
+					realLine.includes('s_overlap 512 列') &&
+					realLine.includes('s 512 列')
+				: realLine.includes('值 512 列') && realLine.includes('打分 512 列');
 			assert(
-				realLine.includes('值 512 列') && realLine.includes('打分 512 列'),
+				segOk,
 				`V4 ${name}：\`[v | s]\` 的"真实尺寸"行分段标出了值 / 打分各占多少列（${realLine}）`
 			);
 		}
@@ -2308,82 +2314,157 @@ console.log('\n[DeepSeek V4 混合注意力：SWA / CSA / HCA]');
 		const comp = (d.trace.layers[layer].attention as HybridTrace).compress!;
 		const grp = comp.groups[comp.groups.length - 1]; // 页面上举的例子：最后一条
 
-		// ① gate 页：投影 → 框出打分那几列 → 加 ape → softmax，**全在同一页**
+		// ① gate 页：投影 → 框出打分那几列
 		const mm = gateStep.tensors.find((t) => t.kind === 'matmul');
 		assert(
 			!!mm && mm.kind === 'matmul' && mm.b.name === 'W_gate' && !!mm.highlightCols?.length,
 			`V4 ${name}：gate 页把 \`W_gate\` 画成矩阵乘，并在结果 \`[v | s]\` 上**框出打分那几列**`
 		);
-		const chain = gateStep.tensors.find((t) => t.name.endsWith('-gate-softmax'));
-		assert(
-			!!chain && chain.kind === 'transform' && chain.input.name === 'ape' && chain.output.name === 's+ape',
-			`V4 ${name}：同一页里跟着 \`ape ──+ s──▶ s + ape\`（"权重从哪来"就在眼前，不拆到下一页）`
-		);
-		// "放大占满宽度"是**逐页开关**，只给 HCA 开：重叠窗口（CSA）那一行 gate 输出有 16 列、
-		// 本来就挤满，放大只会溢出——所以这条规则不能做成全局的。
-		const fills = !!mm?.fillWidth && !!chain?.fillWidth;
-		assert(
-			fills === !overlap,
-			`V4 ${name}：gate 页"放大到占满可用宽度"${overlap ? '不开' : '开'}（fillWidth=${fills}）`
-		);
-		if (chain?.kind === 'transform') {
+
+		// 打分加 ape → softmax → w 放哪：
+		//   · HCA（不重叠）：仍在这一页（`-gate-softmax` 一条链，没有两份打分）；
+		//   · CSA（重叠）：挪到 `-sape` 页，逐 token **双份**打分（`-sape-own` / `-sape-tail`）
+		//     全量 + ape，再窗口堆叠 softmax → w（`-sape-w`）。
+		if (overlap) {
+			const sape = d.steps.find((s) => s.id.endsWith('-sape'));
+			assert(!!sape, 'V4 CSA：打分加 ape → softmax → w 拆到 -sape 页（两份打分全量，gate 页放不下）');
+			const own = sape?.tensors.find((t) => t.name.endsWith('-sape-own'));
+			const tail = sape?.tensors.find((t) => t.name.endsWith('-sape-tail'));
+			const wIn = sape?.tensors.find((t) => t.name.endsWith('-sape-w-in'));
+			const wStep = sape?.tensors.find((t) => t.name.endsWith('-sape-w') && !t.name.endsWith('-sape-w-in'));
+			// 两条并排链：主体份 s + ape、尾巴份 s_overlap + ape，各 8 行全画
 			assert(
-				chain.input.shape[1] === hd && chain.output.shape[1] === hd && chain.then?.result.shape[1] === hd,
-				`V4 ${name}：ape / s + ape / w 三块各只有 ${hd} 列（一行排得下）`
+				own?.kind === 'transform' && own.input.name === 's' && own.output.name === 's+ape' &&
+					own.input.shape[0] === S && own.output.shape[0] === S,
+				`V4 ${name}：\`-sape-own\` 主体份打分 \`s\` ──+ape──▶ \`s+ape\`（8 个 token 全画）`
 			);
-			// **8 个 token 一起画**（不是只切窗口那 4 行）
 			assert(
-				chain.input.shape[0] === S &&
-					chain.output.shape[0] === S &&
-					chain.then?.result.shape[0] === S,
-				`V4 ${name}：ape / s + ape / w 都是 ${S} 行——整个序列一起画，不切窗口那 ${grp.slots.length} 行`
+				tail?.kind === 'transform' && tail.input.name === 's_overlap' && tail.output.name === 's_overlap+ape' &&
+					tail.input.shape[0] === S && tail.output.shape[0] === S,
+				`V4 ${name}：\`-sape-tail\` 尾巴份打分 \`s_overlap\` ──+ape──▶ \`s_overlap+ape\`（8 个 token 全画，在窗口槽位打分左侧上方）`
 			);
-			// 8 行里"这一组自己那几个 token"的行，必须正好等于窗口那 ${window} 行里对应槽位的值
-			const ownSlotOf = (t: number) => (overlap ? ratio : 0) + (t % ratio);
-			const out8 = chain.output.data ?? [];
-			const w8 = chain.then?.result.data ?? [];
-			let tie = out8.length === S && w8.length === S;
-			for (let t = ratio * grp.index; tie && t < ratio * (grp.index + 1); t++) {
-				const slot = ownSlotOf(t);
-				for (let c = 0; tie && c < hd; c++) {
-					if (Math.abs((out8[t]?.[c] ?? 0) - grp.scores[slot][c]) > 1e-15) tie = false;
-					if (Math.abs((w8[t]?.[c] ?? 0) - grp.weights[slot][c]) > 1e-15) tie = false;
+			// 两列布局：tail / own 同 row 同 group（左列，上下堆叠）；窗口槽位打分（`-sape-w-in`
+			// matrix，animated 从空填）同 row 不同 group（右列）且 `vcenter`（垂直居中在两链之间）；
+			// `-sape-w`（softmax→w）接在窗口槽位打分右边、`hideInput`（输入由左边的 matrix 画）
+			assert(
+				tail?.row !== undefined &&
+					tail.row === own?.row &&
+					tail.group === own?.group &&
+					own.group !== undefined &&
+					wIn?.row !== undefined &&
+					wIn.row === tail.row &&
+					wIn.group !== undefined &&
+					wIn.group !== own.group &&
+					wIn.vcenter === true &&
+					wIn.kind === 'matrix' &&
+					wIn.animated === true &&
+					wStep?.kind === 'transform' &&
+					wStep.op.includes('softmax') &&
+					wStep.hideInput === true &&
+					wStep.row === tail.row &&
+					wStep.group !== undefined &&
+					wStep.group !== wIn.group,
+				`V4 ${name}：两列布局——s_overlap/s 链同列堆叠（row=${tail?.row} group='${own?.group}'），窗口槽位打分（matrix animated + vcenter）在右侧（group='${wIn?.group}'），softmax→w 再接一列（group='${wStep?.group}'，hideInput）`
+			);
+			// 窗口 softmax → w：[nE·window × hd] 堆叠，输出 w
+			const winRows = comp.groups.length * grp.slots.length;
+			assert(
+				wStep?.kind === 'transform' &&
+					wStep.op.includes('softmax') &&
+					wStep.output.name === 'w' &&
+					wStep.input.shape[0] === winRows,
+				`V4 ${name}：\`-sape-w\` 把 ${comp.groups.length} 条窗口堆成 ${winRows} 行、逐通道 softmax → w`
+			);
+			// 扫描拼接：窗口槽位打分（`-sape-w-in` matrix animated 逐行）标了 `scan`，seq 长度 = 窗口行数，
+			// 且**交替**指向 tail / own（每条窗口前 ratio 槽 → s_overlap+ape、后 ratio 槽 → s+ape）。
+			assert(
+				wIn?.kind === 'matrix' &&
+					wIn.animated === true &&
+					wIn.revealOrder === 'row' &&
+					!!wIn.scan?.seq &&
+					wIn.scan.seq.length === winRows,
+				`V4 ${name}：\`-sape-w-in\`（窗口槽位打分）是 matrix animated 逐行、标了 scan（seq 长度 ${wIn?.scan?.seq?.length} = 窗口行数 ${winRows}）`
+			);
+			if (wIn?.scan?.seq) {
+				const seq = wIn.scan.seq;
+				const px = name === 'CSA' ? 'csa' : 'hca';
+				// 每条窗口按 ratio 行一组拷贝：前 ratio 行 = s_overlap+ape 的 2 行块、后 ratio 行 = s+ape 的 2 行块；
+				// 窗口 0 的上一组是空槽 → 块为 null。
+				let scanOk = true;
+				for (const gr of comp.groups) {
+					const tailT = gr.slots.slice(0, ratio).filter((t) => t >= 0);
+					const ownT = gr.slots.slice(ratio).filter((t) => t >= 0);
+					const tailBlock = tailT.length
+						? { target: `${px}-sape-tail`, from: Math.min(...tailT), to: Math.max(...tailT) }
+						: null;
+					const ownBlock = ownT.length
+						? { target: `${px}-sape-own`, from: Math.min(...ownT), to: Math.max(...ownT) }
+						: null;
+					for (let j = 0; scanOk && j < gr.slots.length; j++) {
+						const e = seq[gr.index * gr.slots.length + j];
+						const expect = j < ratio ? tailBlock : ownBlock;
+						if (expect === null) scanOk = e === null;
+						else
+							scanOk =
+								!!e &&
+								e.target === expect.target &&
+								e.from === expect.from &&
+								e.to === expect.to;
+					}
 				}
+				assert(
+					scanOk,
+					`V4 ${name}：扫描 seq 行块对应正确——每条窗口前 ${ratio} 行 → s_overlap+ape 的 2 行块、后 ${ratio} 行 → s+ape 的 2 行块，空槽块 null（交替，三矩阵框都 2 行高）`
+				);
 			}
 			assert(
-				tie,
-				`V4 ${name}：8 行里"这一组自己那几个 token"的行 = 窗口那 ${grp.slots.length} 行对应槽位的 \`s + ape\` / \`w\`（同一份数据）`
+				!gateStep.tensors.some((t) => t.name.endsWith('-gate-softmax')),
+				`V4 ${name}：gate 页不再画打分链（挪到 -sape 页了），gate 页只剩投影 + 注解`
 			);
+		} else {
+			// HCA：打分加 ape → softmax 仍在这一页（一条链，`ape ──+ s──▶ s+ape ──softmax──▶ w`）
+			const chain = gateStep.tensors.find((t) => t.name.endsWith('-gate-softmax'));
 			assert(
-				chain.then?.op.includes('softmax'),
-				`V4 ${name}：链尾是 softmax（逐通道）——打分加完 ape 立刻归一化`
+				!!chain && chain.kind === 'transform' && chain.input.name === 'ape' && chain.output.name === 's+ape',
+				`V4 ${name}：同一页里跟着 \`ape ──+ s──▶ s + ape\`（"权重从哪来"就在眼前）`
 			);
-		}
-		// softmax 只该出现在 gate 页
-		assert(
-			!poolStep.tensors.some((t) => t.name.includes('softmax') || t.name.includes('source')),
-			`V4 ${name}：pool 页不再重复画 \`[v | s]\` 和 softmax（那两块已经并进 gate 页了）`
-		);
-		// 矩阵乘与打分链**并排一行**（`row` 相同、`group` 不同 → 渲染成 `.hrow`）
-		assert(
-			mm?.row !== undefined && mm.row === chain?.row && mm.group !== chain?.group,
-			`V4 ${name}：矩阵乘与 \`ape ──+ s──▶ s+ape ──softmax──▶ w\` **并排一行**（共用 row=${mm?.row}）`
-		);
-		// `s + ape` 与 softmax 必须**先后**算：`then`（逐行）要另起一段
-		if (chain?.kind === 'transform') {
-			const w = transformPhaseMs(chain);
+			// "放大占满宽度"是**逐页开关**，只给 HCA 开
+			const fills = !!mm?.fillWidth && !!chain?.fillWidth;
 			assert(
-				w.rows > 0 && w.rows2 > 0,
-				`V4 ${name}：\`s + ape\` 与 softmax **分两段先后**算（${w.rows}ms → ${w.rows2}ms）`
+				fills === !overlap,
+				`V4 ${name}：gate 页"放大到占满可用宽度"${overlap ? '不开' : '开'}（fillWidth=${fills}）`
 			);
+			if (chain?.kind === 'transform') {
+				assert(
+					chain.input.shape[1] === hd && chain.output.shape[1] === hd && chain.then?.result.shape[1] === hd,
+					`V4 ${name}：ape / s + ape / w 三块各只有 ${hd} 列（一行排得下）`
+				);
+				assert(
+					chain.input.shape[0] === S &&
+						chain.output.shape[0] === S &&
+						chain.then?.result.shape[0] === S,
+					`V4 ${name}：ape / s + ape / w 都是 ${S} 行——整个序列一起画`
+				);
+				assert(
+					chain.then?.op.includes('softmax'),
+					`V4 ${name}：链尾是 softmax（逐通道）——打分加完 ape 立刻归一化`
+				);
+			}
 		}
+		// gate 页的 `[v | s]` 投影块不能重复画到 pool 页（那是 gate 页独有的）。
+		assert(
+			!poolStep.tensors.some((t) => t.kind === 'matmul' && t.b.name === 'W_gate'),
+			`V4 ${name}：pool 页不重复画 \`W_gate\` 的 \`[v | s]\` 投影块（那只在 gate 页）`
+		);
 
-		// ② pool 页：只用权重 —— `w ⊙ v` 一块 + 箭头 + 一行 v̄
+		// ② pool 页：权重怎么算 + 怎么用 —— `w 计算链` + `w ⊙ v` 一块 + 箭头 + 一行 v̄
 		//
 		// 不重叠（HCA）用 `ewise`：`w` 与 `v` 都从上一页的完整矩阵拷过来、画成和矩阵乘同一个 2×2，
-		// **8 个 token 全画**，框出这条条目看的窗口那几行。
-		// 重叠窗口（CSA）下同一个 token 在两条窗口里权重不同，逐 token 的 8 行加起来不等于 v̄，
-		// 所以那边保持"窗口那 window 行"的 `matrix` 写法。
+		// **8 个 token 全画**、逐组（ratio 行一组）揭示。
+		// 重叠窗口（CSA）下同一个 token 会同时出现在两条窗口、权重不同，逐 token 的 8 行加起来
+		// 不等于 v̄，所以把 **4 条窗口**各 4 行上下堆成一块 `[nE·window × hd]`，同样用 `ewise` +
+		// `groupRows = window` 逐组揭示；每条窗口的 window 行按列加 = 那组自己的 1 条。
+		// 另外 CSA 还在 pool 页加了条"打分→softmax→w"的 w 计算链（用户要求权重过程也在这页可见）。
 		const prod = poolStep.tensors.find(
 			(t) => t.name.endsWith('-pool-prod') || t.name.endsWith('-pool-ewise')
 		);
@@ -2391,23 +2472,54 @@ console.log('\n[DeepSeek V4 混合注意力：SWA / CSA / HCA]');
 		const grpN = grp.slots.length;
 
 		if (overlap) {
+			// CSA：重叠窗口。`w ⊙ v` 用 `ewise` 把 **4 条窗口**上下堆成一块 `[nE·window × hd]`，
+			// `groupRows = window` 逐组（一条窗口一组）揭示。不能用 HCA 的"逐 token 8 行"：
+			// 重叠下同一个 token 会同时出现在两条窗口、权重不同，逐 token 行求和算不出条目。
 			assert(
-				!!prod && prod.kind === 'matrix' && prod.data.length === grpN,
-				`V4 ${name}：\`w ⊙ v\` 画成一个 ${grpN} 行的矩阵（不是把 ${grpN} 个 token 拆成 ${grpN} 块）`
+				!!prod && prod.kind === 'ewise' && prod.op === '⊙',
+				`V4 ${name}：\`w ⊙ v\` 用**逐元素**视图画（两个操作数都画出来，不是只画结果）`
 			);
-			if (prod?.kind === 'matrix') {
+			if (prod?.kind === 'ewise') {
+				const nWin = comp.groups.length;
+				const stacked = nWin * grpN;
+				// 操作数 & 结果是"按窗口堆叠"：[nE·window × hd]
+				assert(
+					prod.out.shape[0] === stacked &&
+						prod.a.shape[0] === stacked &&
+						prod.b.shape[0] === stacked,
+					`V4 ${name}：\`v\` / \`w\` / \`w ⊙ v\` 都是 ${nWin} 条窗口 × ${grpN} 行 = ${stacked} 行（窗口堆叠，不是 HCA 的逐 token 行）`
+				);
+				assert(
+					prod.a.name === 'v' && prod.b.name === 'w',
+					`V4 ${name}：左操作数 \`v\`（各窗口的值）、右操作数 \`w\`（各窗口的权重）`
+				);
+				assert(
+					prod.groupRows === grpN,
+					`V4 ${name}：\`w ⊙ v\` 逐组揭示、一条窗口一组（${grpN} 行，实际 ${prod.groupRows}）`
+				);
+				// 逐元素 = 两个同位置的格子相乘
+				const outData = prod.out.data!;
+				const aData = prod.a.data!;
+				const bData = prod.b.data!;
 				let same = true;
-				for (let j = 0; same && j < grp.values.length; j++)
+				for (let t = 0; same && t < outData.length; t++)
 					for (let c = 0; same && c < hd; c++)
-						if (Math.abs((prod.data[j][c] ?? 0) - grp.values[j][c] * grp.weights[j][c]) > 1e-15)
-							same = false;
-				assert(same, `V4 ${name}：\`w ⊙ v\` 逐元素 = 权重 × 值`);
-				let colOk = true;
-				for (let c = 0; colOk && c < hd; c++) {
-					const acc = prod.data.reduce((s2, row) => s2 + row[c], 0);
-					if (Math.abs(acc - grp.pooled[c]) > 1e-12) colOk = false;
-				}
-				assert(colOk, `V4 ${name}：把 \`w ⊙ v\` 按列加起来 = v̄（${grpN} 行 → 1 条压缩条目）`);
+						if (Math.abs((outData[t][c] ?? 0) - aData[t][c] * bData[t][c]) > 1e-15) same = false;
+				assert(same, `V4 ${name}：\`w ⊙ v\` 逐元素 = \`v\` × \`w\`（同位置的格子）`);
+				// 每条窗口的 `window` 行按列加起来 = 那组自己的 1 条（逐条对上）
+				let allWinOk = true;
+				comp.groups.forEach((gr, g) => {
+					const base = g * grpN;
+					for (let c = 0; allWinOk && c < hd; c++) {
+						let acc = 0;
+						for (let j = 0; j < grpN; j++) acc += outData[base + j][c];
+						if (Math.abs(acc - gr.pooled[c]) > 1e-12) allWinOk = false;
+					}
+				});
+				assert(
+					allWinOk,
+					`V4 ${name}：每条窗口的 ${grpN} 行按列加起来 = 那组自己的 1 条压缩条目`
+				);
 			}
 		} else {
 			assert(
@@ -2468,7 +2580,7 @@ console.log('\n[DeepSeek V4 混合注意力：SWA / CSA / HCA]');
 		}
 
 		// 结果块：**整段序列压出的全部条目**（不是只拿一条举例），画成 `[nE × hd]` 的小矩阵，
-		// 逐格跟着上游出现。
+		// 在 `w ⊙ v` 算完之后逐行出现（分开的两段）。
 		const allEntries = (d.trace as HybridTrace).layers[layer].attention.compress!.entries;
 		const nEnt = allEntries.length;
 		assert(
@@ -2484,14 +2596,13 @@ console.log('\n[DeepSeek V4 混合注意力：SWA / CSA / HCA]');
 					result.revealGroup === undefined &&
 					result.revealOrder !== 'col' &&
 					result.highlightRows === undefined,
-				`V4 ${name}：结果逐格跟着上游出现（先出完第 1 条再第 2 条），不写死框`
+				`V4 ${name}：结果在 w ⊙ v 之后**逐行**出现（先出完第 1 条再第 2 条），不写死框`
 			);
 		} else {
+			// CSA：结果逐组跟着上游出现——一条窗口算完 → 那 1 条的那一行（`groupRows` 一组 window 行）
 			assert(
-				result?.kind === 'matrix' &&
-					result.highlightRows?.[0] === nEnt - 1 &&
-					result.highlightRows?.[1] === nEnt - 1,
-				`V4 ${name}：框出的是这一页举例的那一条（第 ${nEnt} 条）`
+				result?.kind === 'matrix' && result.groupRows === grpN,
+				`V4 ${name}：结果在 w ⊙ v 之后**一行一组**出现（一条窗口 = 1 行，${grpN} 行一组，实际 ${result?.groupRows}）`
 			);
 		}
 		// 每一组按列加出来 = 对应的那一条（逐条对上，不只是举例那条）
@@ -2506,54 +2617,31 @@ console.log('\n[DeepSeek V4 混合注意力：SWA / CSA / HCA]');
 			prod?.row !== undefined && prod.row === result?.row && !prod.parallel,
 			`V4 ${name}：\`w ⊙ v\` 与结果排在同一行（中间画 →），而不是上下堆着`
 		);
-		// 相加的过程要**看得见**：`w ⊙ v` 按列揭示，一整列算完结果才出对应的那一格。
-		// 两边必须**同一个进度**（`sync`）而且换算式对得上，否则会"列还没算完数就冒出来"。
+		// 相加的过程要**看得见**：`w ⊙ v` 按列逐格揭示（`Σ_j` 是沿着列加的）。
 		assert(
 			(prod?.kind === 'matrix' || prod?.kind === 'ewise') &&
 				prod.revealOrder === 'col' &&
 				(prod.kind === 'ewise' || !!prod.animated),
 			`V4 ${name}：\`w ⊙ v\` **按列**逐格揭示（\`Σ_j\` 是沿着列加的）`
 		);
-		if (!overlap) {
-			assert(
-				!!prod?.sync && !!result?.sync && !!result.animated && result.groupRows === plan4,
-				`V4 ${name}：\`w ⊙ v\` 与结果共用同一段进度，且"每算完一组的一列就出一格"对得上`
-			);
-		} else {
-			// 重叠窗口版：上游只画窗口那 `window` 行，结果**整列一起出现**
-			assert(
-				!!prod?.sync && !!result?.sync && !!result.animated && result.revealGroup === grpN,
-				`V4 ${name}：\`w ⊙ v\` 与结果共用同一段进度，且"每 ${grpN} 格算完一整列"对得上`
-			);
-		}
+		// 先算 `w ⊙ v`、后算 `v̄`：两个视图**不共用进度**（不用 `sync`），各自一段依次播。
+		// 共用进度的话，"每算完一组的一列结果就出一格"，相乘和求和会在画面上缠在一起。
+		assert(
+			!prod?.sync && !result?.sync && !prod?.parallel && !result?.parallel,
+			`V4 ${name}：\`w ⊙ v\` 与结果**不共用进度**（先整块算相乘、后算求和，各占一段）`
+		);
 		assert(
 			isAnimatable(prod!) && isAnimatable(result!),
 			`V4 ${name}：\`w ⊙ v\` 与结果都是可动画视图（结果原来一上来就整行显示完了）`
 		);
 		{
-			// 严格同步：`reveal` 取遍 0..1，两边"算完的揭示单位数"必须始终相等。
-			// HCA（逐组）：揭示单位 = "一组的一列"（`plan4` 格）→ 结果出 1 格；
-			// CSA（重叠窗口）：揭示单位 = "一整列"（`grpN` 格）→ 结果出 `nEnt` 格（整列一起亮）。
-			const per = overlap ? grpN : plan4;
-			const perResult = overlap ? nEnt : 1;
-			let sync = true;
-			let worst = '';
-			for (let k = 0; k <= 100; k++) {
-				const rv = k / 100;
-				const done = Math.round(rv * (overlap ? grpN : S) * hd); // 左边揭示了几格
-				const units = Math.floor(done / per); // 算完几个揭示单位
-				const shown = overlap
-					? Math.floor(Math.round(rv * hd * grpN) / grpN) * nEnt // 整列一起亮
-					: Math.floor(Math.round(rv * nEnt * hd * plan4) / plan4); // 逐格跟着出现
-				if (shown !== units * perResult) {
-					sync = false;
-					worst = `reveal=${rv}：算完 ${units} 个单位（应出 ${units * perResult} 格）但出了 ${shown} 格`;
-					break;
-				}
-			}
+			// 分开算：`w ⊙ v` 与 `v̄` 必须落在**不同的动画单元**（依次播），且相乘先于求和
+			const poolUnits = animationUnits(poolStep);
+			const uProd = poolUnits.findIndex((u) => u.includes(prod!));
+			const uRes = poolUnits.findIndex((u) => u.includes(result!));
 			assert(
-				sync,
-				`V4 ${name}：整段进度上"算完的揭示单位数"与"结果出现的格数"始终相等${worst ? '（' + worst + '）' : ''}`
+				uProd >= 0 && uRes >= 0 && uProd !== uRes && uProd < uRes,
+				`V4 ${name}：\`w ⊙ v\`（单元 ${uProd}）与 \`v̄\`（单元 ${uRes}）是**两个依次播的单元**，相乘先于求和`
 			);
 		}
 	}
@@ -2623,6 +2711,105 @@ console.log('\n[DeepSeek V4 混合注意力：SWA / CSA / HCA]');
 		}
 	}
 	assert(pickOk, '压缩条目只有被 indexer 选中的那些进 softmax，其余是 −∞');
+
+	{
+		const logitsStep = csaDemo.steps.find((s) => s.id === 'csa-indexer-logits')!;
+		const topkView = logitsStep.tensors.find((t) => t.kind === 'mask');
+		assert(
+			!!topkView && topkView.kind === 'mask' && topkView.matrixName === 'top-k 选择',
+			'indexer-logits 页有一个"top-k 选择"掩码视图（逐行揭示选中 / 落选 / 未出生）'
+		);
+		if (topkView?.kind === 'mask') {
+			assert(
+				topkView.scores === idx.logits && topkView.shape[0] === S && topkView.shape[1] === cs.nE,
+				'选择矩阵画的就是 I 的打分（[S × nE]）：选中的格子保留分数、其余 ∅'
+			);
+			let selOk = true;
+			for (let i = 0; i < S; i++)
+				for (let e = 0; e < cs.nE; e++) {
+					const want = idx.topk[i].includes(e) && cg[e].bornAt <= i ? 1 : 0;
+					if (topkView.mask[i][e] !== want || cs.mask[i][S + e] !== topkView.mask[i][e]) selOk = false;
+				}
+			assert(selOk, '选择矩阵每格 = 该行 top-k 是否选中该条目，且与 -attn 掩码的压缩列逐格一致（第 15 页 → 第 17 页）');
+		}
+	}
+
+	{
+		const attnStep = csaDemo.steps.find((s) => s.id === 'csa-attn')!;
+		const chain = attnStep.tensors.find((t) => t.kind === 'transform')!;
+		assert(
+			chain.kind === 'transform' && !!chain.preMask && !!chain.preMaskParts,
+			'csa-attn：掩码带来源段（preMaskParts），三段依次播'
+		);
+		if (chain.kind === 'transform' && chain.preMaskParts) {
+			const parts = chain.preMaskParts;
+			assert(
+				parts.length === 3 &&
+					parts[0].from === 0 &&
+					parts[0].to === S - 1 &&
+					parts[1].from === S &&
+					parts[1].to === S + cs.nE - 1 &&
+					parts[2].from === S + cs.nE &&
+					parts[2].to === S + cs.nE,
+				`三段列区间正好盖住 token（0..${S - 1}）/ 压缩（${S}..${S + cs.nE - 1}）/ sink（${S + cs.nE}）`
+			);
+			assert(
+				parts[0].label.includes('滑窗') &&
+					parts[1].label.includes('top-k 选择') &&
+					parts[2].label.includes('恒保留'),
+				'三段注解写明各自来源：滑窗规则 / 第 15 页的 top-k 选择 / sink 恒保留'
+			);
+		}
+	}
+
+	{
+		const attnStep = csaDemo.steps.find((s) => s.id === 'csa-attn')!;
+		const chain = attnStep.tensors.find((t) => t.kind === 'transform')!;
+		assert(
+			chain.kind === 'transform' && !!chain.topRef && chain.topRef.colFrom === S,
+			'csa-attn：top-k 选择矩阵作为 topRef 叠在 S 的压缩列上方（colFrom = S，不另占一行）'
+		);
+		if (chain.kind === 'transform' && chain.topRef) {
+			const tv = chain.topRef.view;
+			assert(
+				tv.kind === 'mask' && tv.scores === idx.logits && tv.shape[0] === S && tv.shape[1] === cs.nE,
+				'topRef 就是 top-k 选择矩阵（[S × nE]，scores = I 的打分）'
+			);
+			let selOk = true;
+			for (let i = 0; i < S; i++)
+				for (let e = 0; e < cs.nE; e++) {
+					const want = idx.topk[i].includes(e) && cg[e].bornAt <= i ? 1 : 0;
+					if (
+						tv.kind === 'mask' &&
+						(tv.mask[i][e] !== want || cs.mask[i][S + e] !== tv.mask[i][e])
+					)
+						selOk = false;
+				}
+			assert(selOk, 'topRef 选择矩阵与 -attn 掩码的压缩列逐格一致（这就是叠在 S 上方的依据）');
+			assert(
+				!attnStep.tensors.some((t) => t.kind === 'matrix' && t.name.endsWith('-attn-i')),
+				'csa-attn 没有独立的 I 参考视图了（topRef 替掉了它）'
+			);
+		}
+	}
+	{
+		const hcaChain = hcaDemo.steps
+			.find((s) => s.id === 'hca-attn')!
+			.tensors.find((t) => t.kind === 'transform')!;
+		assert(
+			hcaChain.kind === 'transform' &&
+				hcaChain.preMaskParts?.length === 3 &&
+				hcaChain.preMaskParts[1].label.includes('全保留'),
+			'HCA 掩码也是三段，但压缩段的注解是"写出的全保留（不检索）"'
+		);
+		const swaChain = swaDemo.steps
+			.find((s) => s.id.endsWith('-attn'))!
+			.tensors.find((t) => t.kind === 'transform')!;
+		assert(
+			swaChain.kind === 'transform' && swaChain.preMaskParts?.length === 2,
+			'SWA 无压缩列：掩码只有 token + sink 两段'
+		);
+	}
 	assert(
 		cs.probs.every((head) => head.every((row) => Math.abs(row.reduce((a, b) => a + b, 0) - 1) < 1e-9)),
 		'两类 KV + sink 进的是**同一个** softmax（每行仍然和为 1）'

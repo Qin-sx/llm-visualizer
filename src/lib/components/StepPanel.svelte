@@ -147,6 +147,26 @@
 	}
 
 	/**
+	 * 扫描拼接驱动：找标了 `scan` 的视图（如窗口槽位打分），按它的 reveal 进度算出
+	 * "正在填出来的那一行"，查 `scan.seq[r]` 得到来源**行块**（目标视图 + from/to），给目标视图
+	 * 设 `scanRows`——于是源矩阵上出现一个随窗口 reveal **移动的、和拷贝行数一致高**的扫描框
+	 * （一次拷 `ratio` 行 → 三个矩阵的框都是 `ratio` 行高）。
+	 */
+	const scanRows = $derived.by(() => {
+		const map = new Map<string, [number, number]>();
+		for (const t of step.tensors) {
+			if (!t.scan?.seq) continue;
+			const rows = t.shape[0] ?? 0;
+			if (!rows) continue;
+			const p = subProgress(t);
+			const r = Math.min(rows - 1, Math.floor(p * rows));
+			const entry = t.scan.seq[r];
+			if (entry) map.set(entry.target, [entry.from, entry.to]);
+		}
+		return map;
+	});
+
+	/**
 	 * 布局：先按 `row` 切成横向的"行"，行内再按 `group` 切成纵向堆叠的"列"。
 	 * 没有 `row` 的视图各自独占一行。
 	 */
@@ -154,14 +174,18 @@
 		const rows: {
 			row?: number;
 			parallel: boolean;
+			vcenter: boolean;
+			noHsep: boolean;
 			cols: { group?: string; items: TensorView[] }[];
 		}[] = [];
 		for (const t of step.tensors) {
 			let r = rows[rows.length - 1];
 			if (t.row === undefined || !r || r.row !== t.row) {
-				r = { row: t.row, parallel: !!t.parallel, cols: [] };
+				r = { row: t.row, parallel: !!t.parallel, vcenter: !!t.vcenter, noHsep: !!t.noHsep, cols: [] };
 				rows.push(r);
 			}
+			if (t.vcenter) r.vcenter = true;
+			if (t.noHsep) r.noHsep = true;
 			let c = r.cols[r.cols.length - 1];
 			if (t.group === undefined || !c || c.group !== t.group) {
 				c = { group: t.group, items: [] };
@@ -171,6 +195,12 @@
 		}
 		return rows;
 	});
+
+	/** 这一列是否**自带行首箭头**（`hideInput` 的变换：输入由左边矩阵画，行首是它自己的引头）——
+	 *  这时 `.hrow` 不再重复画 `→`（否则 `v̄ → RMSNorm ──▶ v̄~` 会冒出两个连续箭头）。 */
+	function hasLeadArrow(items: TensorView[]): boolean {
+		return items.some((t) => t.kind === 'transform' && !!t.hideInput);
+	}
 
 	/**
 	 * 并排各列的**垂直对齐**（按"每列最后一块矩阵的顶边"对齐）。
@@ -307,17 +337,41 @@
 			// ── ③ 并排各列的垂直对齐（按"每列最后一块矩阵的顶边"对齐）──
 			// 放在 ② **之后**：注解定高会改块的内部高度、矩阵顶边跟着动，
 			// 先对再改就等于拿旧位置对了一遍。
-			const next = rows.map((row) => {
+			const next = rows.map((row, ri) => {
 				const cols = [...row.querySelectorAll<HTMLElement>(':scope > .hcol')];
 				if (cols.length < 2) return [];
 				// 已经加上的偏移要从量到的位置里扣掉，否则"量 → 改 → 再量"会自己滚自己
 				const applied = cols.map((c) => parseFloat(c.style.marginTop) || 0);
 				const tops = cols.map((col, i) => col.getBoundingClientRect().top - applied[i]);
-				const anchors = cols.map((col, i) => {
-					const blocks = col.querySelectorAll<SVGElement>('svg.block');
-					const last = blocks[blocks.length - 1];
-					return last ? last.getBoundingClientRect().top - applied[i] : null;
-				});
+				const blocks = cols.map((col, i) =>
+					[...col.querySelectorAll<SVGElement>('svg.block')].map((b) => {
+						const r = b.getBoundingClientRect();
+						return { top: r.top - applied[i], bottom: r.bottom - applied[i] };
+					})
+				);
+				// `vcenter`：这一行改成**垂直居中**——每列内容（第一块顶 到 最后一块底）的中心
+				// 对齐到"内容跨度最大那一列"的中心。用于"右边一块要夹在左边两块中间"的场合
+				// （如 `-sape` 页：窗口槽位打分垂直居中于 s_overlap 链和 s 链之间）。
+				if (layout[ri]?.vcenter) {
+					let maxSpan = 0;
+					let tTop = 0;
+					for (const bs of blocks) {
+						if (!bs.length) continue;
+						const span = bs[bs.length - 1].bottom - bs[0].top;
+						if (span > maxSpan) {
+							maxSpan = span;
+							tTop = bs[0].top;
+						}
+					}
+					if (!maxSpan) return cols.map(() => 0);
+					const targetCenter = tTop + maxSpan / 2;
+					return blocks.map((bs, i) => {
+						if (!bs.length) return +((targetCenter - tops[i]).toFixed(2));
+						const span = bs[bs.length - 1].bottom - bs[0].top;
+						return +(targetCenter - (bs[0].top + span / 2)).toFixed(2);
+					});
+				}
+				const anchors = blocks.map((bs) => (bs.length ? bs[bs.length - 1].top : null));
 				const real = anchors.filter((a): a is number => a !== null);
 				if (!real.length) return cols.map(() => 0);
 				const max = Math.max(...real);
@@ -334,6 +388,40 @@
 						a.length === rowOffsets[i]?.length && a.every((v, j) => v === rowOffsets[i][j])
 				);
 			if (!same) rowOffsets = next;
+
+			// ── ④ 横向箭头（`→`）的垂直定位 ──────────────────────────
+			// harrow 默认 `align-self: center` 居中于整行，行被最高列（如 2×2 矩阵乘）撑起时
+			// 会悬空；这里量相邻两列**最后一块矩阵**中心的均值，把箭头挪过去。
+			rows.forEach((row, ri) => {
+				const arrows = [...row.querySelectorAll<HTMLElement>(':scope > .harrow')];
+				if (!arrows.length) return;
+				const cols = [...row.querySelectorAll<HTMLElement>(':scope > .hcol')];
+				if (cols.length < 2) return;
+				// 用 ③ 刚算出的列偏移（`next`）预测矩阵落点（`rowOffsets` 还未回流）
+				const expect = next[ri] ?? [];
+				const blocks = cols.map((col, i) => {
+					const applied = parseFloat(col.style.marginTop) || 0;
+					const shift = expect[i] ?? applied;
+					return [...col.querySelectorAll<SVGElement>('svg.block')].map((b) => {
+						const r = b.getBoundingClientRect();
+						return { top: r.top - applied + shift, bottom: r.bottom - applied + shift };
+					});
+				});
+				arrows.forEach((ar, ai) => {
+					const a = blocks[ai];
+					const b = blocks[ai + 1];
+					if (!a?.length || !b?.length) return;
+					const centerA = (a[a.length - 1].top + a[a.length - 1].bottom) / 2;
+					const centerB = (b[b.length - 1].top + b[b.length - 1].bottom) / 2;
+					const target = (centerA + centerB) / 2;
+					// 基于"当前没加 margin 的位置"算偏移，重复量不会自己滚自己
+					const rawTop = ar.getBoundingClientRect().top - (parseFloat(ar.style.marginTop) || 0);
+					const h = ar.getBoundingClientRect().height;
+					const mt = target - (rawTop + h / 2);
+					if (Math.abs(mt - (parseFloat(ar.style.marginTop) || 0)) > 0.05)
+						ar.style.marginTop = `${mt.toFixed(2)}px`;
+				});
+			});
 		};
 
 		// 挂载时**不立即量**：同步 measure 会把对齐的强制重排（getBoundingClientRect → 全页布局）
@@ -442,27 +530,34 @@
 					<div class="hrow" class:parallel={r.parallel}>
 						{#each r.cols as c, ci (ci)}
 							{#if ci > 0}
-								{#if r.parallel}
+								{#if r.parallel && !r.noHsep}
 								<!--
 									并行分支之间画一条**浅色虚线**，而不是 `→`：这两块的运算是**各算各的**
 									（如分组输出投影的 `o^(0)` / `o^(1)`、MoE 里两个专家 E0 / E2），
-									只是并排放在一起，没有先后。
+									只是并排放在一起，没有先后。标了 `noHsep` 的并行行（相关计算，如
+									`-sape` 的 s_overlap / s 同时加 ape 但汇向同一个窗口槽位打分）改画箭头。
 								-->
 									<span class="hsep" aria-hidden="true"></span>
+								{:else if hasLeadArrow(r.cols[ci].items)}
+								<!--
+									这一列是 `hideInput` 的变换（输入由左边矩阵画）：它行首**自己带引头**
+									（如 `RMSNorm ──▶`），外面再画一个 `→` 就成了两个连续箭头。
+								-->
+									<span aria-hidden="true"></span>
 								{:else}
 									<span class="harrow">→</span>
 								{/if}
 							{/if}
 							<div class="hcol" style:margin-top={`${rowOffsets[ri]?.[ci] ?? 0}px`}>
 								{#each c.items as t (t.name)}
-									<Tensor view={t} progress={subProgress(t)} compact cellSize={rowCell[ri]} />
+									<Tensor view={t} progress={subProgress(t)} compact cellSize={rowCell[ri]} scanRows={scanRows.get(t.name)} />
 								{/each}
 							</div>
 						{/each}
 					</div>
 				{:else}
 					{#each r.cols[0].items as t (t.name)}
-						<Tensor view={t} progress={subProgress(t)} cellSize={rowCell[ri]} />
+						<Tensor view={t} progress={subProgress(t)} cellSize={rowCell[ri]} scanRows={scanRows.get(t.name)} />
 					{/each}
 				{/if}
 			{/each}
@@ -641,6 +736,12 @@
 		 */
 		flex-shrink: 1;
 		min-width: min-content;
+	}
+	/* 最后一列把**剩下的宽度吃掉**（同各视图内部 grid 的"最后一列 1fr"，原则 ⑤）：
+	   右侧没有别的块时，这一列的注解（如 `-indexer-logits` 的 top-k 选择说明）可以一路延伸到行尾，
+	   而不是被 `min-content` 卡在"最大单词宽度"上折成好几行 */
+	.hcol:last-child {
+		flex-grow: 1;
 	}
 	.harrow {
 		align-self: center;

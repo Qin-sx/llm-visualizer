@@ -83,10 +83,15 @@ export function buildOverviewItems(steps: Step[]): OverviewItem[] {
 		let node: OverviewItem | null = null;
 		/** 并行分支个数 */
 		let parallel = 1;
+		/** 当前节点的来源行（并行的 ×N 只统计**同行**的分支——不同行的并行是另一回事） */
+		let nodeRow: number | undefined;
 
 		for (const t of anim) {
-			// 并行行（一个 token 同时过多个专家）：只让第一个视图出节点，其余只计数
-			if (t.parallel && node) {
+			const before: OverviewItem | null = node;
+			// 并行行（一个 token 同时过多个专家）：只让第一个视图出节点，其余只计数。
+			// 必须同行才算：`-indexer-w` 里矩阵乘（row 1）之后的两个 ewise（row 2、parallel）
+			// 是它们自己的并行分支，不能算到矩阵乘头上。
+			if (t.parallel && node && t.row === nodeRow) {
 				parallel++;
 				continue;
 			}
@@ -156,6 +161,8 @@ export function buildOverviewItems(steps: Step[]): OverviewItem[] {
 				default:
 					break;
 			}
+			// 这一步的 switch 换过节点的话，记下它的行（供并行的同行判断）
+			if (node !== before) nodeRow = t.row;
 		}
 
 		// 上面只处理"自带具名操作数"的视图。`matrix` / `row` / `bars` / `ewise` 这几类没有
@@ -168,8 +175,8 @@ export function buildOverviewItems(steps: Step[]): OverviewItem[] {
 		// 才从源头讲起（`w ⊙ v → 压缩 KV`，中间那段是这一页的细节）。
 		//
 		// 这里遍历**全部**张量而不是只遍历动画视图：命名"这一步产出了什么"的那一块
-		// 不一定是动画的那一块（CSA 的 `-indexer-topk`：动的是打分矩阵 `I`，
-		// 但"挑出了什么"由旁边那一行数值 `top-k` 说明）。
+		// 不一定是动画的那一块（CSA 的 `-indexer-logits`：节点由 Σ 推出（`头0·w0 → I`），
+		// 但"挑出了什么"由下面那一行 `top-k` 说明）。
 		// 具名节点优先——已经推出节点时不再覆盖（`-compress-kv` 这类步骤两者都有）。
 		if (!node) {
 			const named = step.tensors.map(synthRef).filter((r): r is MatRef => !!r);

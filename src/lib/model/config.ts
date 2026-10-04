@@ -149,8 +149,8 @@ export const V4_FLASH_CFG: ModelConfigLike & { seed: number } = {
 	rope_theta: 10000, // 纯滑窗层用主 RoPE
 	compress_rope_theta: 40000, // 压缩层改用压缩版 YaRN RoPE（真实 base 40000）
 
-	index_n_heads: 2, // indexer 的头数与每头维度（真实 64 / 128）
-	index_head_dim: 4,
+	index_n_heads: 2, // indexer 的头数（真实 64）
+	index_head_dim: 2, // indexer 每头维度（真实 128）——比注意力的 head_dim=4 更窄，q^I 和 Q 一眼可分
 	index_topk: 2, // 4 条压缩条目里挑 2 条（真实 512）
 
 	o_groups: 2, // 输出投影分成 2 组各自降到低秩（真实 8 组）

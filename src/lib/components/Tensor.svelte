@@ -26,8 +26,9 @@
 		view,
 		progress = 0,
 		compact = false,
-		cellSize
-	}: { view: TensorView; progress?: number; compact?: boolean; cellSize?: number } = $props();
+		cellSize,
+		scanRows
+	}: { view: TensorView; progress?: number; compact?: boolean; cellSize?: number; scanRows?: [number, number] | null } = $props();
 
 	const barMax = $derived(view.kind === 'bars' ? Math.max(1, ...view.data) : 1);
 	/** 已长出来的柱子数（不带动画的分布一次画满） */
@@ -87,6 +88,7 @@
 			revealOrder={view.revealOrder}
 			revealGroup={view.revealGroup}
 			groupRows={view.groupRows}
+			scanRows={scanRows}
 		/>
 	{:else if view.kind === 'tiles'}
 		<div class="flex flex-wrap gap-3">
@@ -122,7 +124,7 @@
 	{:else if view.kind === 'concat'}
 		<ConcatView {view} {progress} />
 	{:else if view.kind === 'transform'}
-		<TransformView {view} {progress} {compact} cellSize={cellSize ?? view.cellSize} />
+		<TransformView {view} {progress} {compact} cellSize={cellSize ?? view.cellSize} {scanRows} />
 	{:else if view.kind === 'sum'}
 		<SumView {view} {progress} {compact} />
 	{:else if view.kind === 'lookup'}

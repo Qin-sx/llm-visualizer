@@ -67,6 +67,29 @@ export interface TensorViewBase {
 	 */
 	parallel?: boolean;
 	/**
+	 * 布局：这一行并排的各列改成**垂直居中**对齐（默认按"每列最后一块矩阵的顶边"对齐）。
+	 *
+	 * 用于"左右两块要夹在中间"的场合（如 `-sape` 页：左边 s_overlap / s 两条链上下分布，
+	 * 右边的窗口槽位打分要**垂直居中**在它们之间）。标在任一视图上对该行生效。
+	 */
+	vcenter?: boolean;
+	/**
+	 * 并行行（`parallel`）里默认在列间画**浅色虚线**（表示"各算各的、完全无关"，如 MoE 的两个专家）。
+	 * 标了 `noHsep` 的行改成画 `→` 箭头——用于"并行但**相关**"的计算（如 `-sape` 页的
+	 * s_overlap / s 同时加 ape，但都汇向同一个窗口槽位打分，不是无关分支）。
+	 */
+	noHsep?: boolean;
+	/**
+	 * **扫描拼接**：这个视图在 reveal 时，把"正在填出来的那一段行"的来源行块高亮到别的视图上。
+	 *
+	 * 用于 `-sape` 页：窗口槽位打分逐行 reveal（拼接），每一行的值来自 s_overlap+ape 或 s+ape 的
+	 * 某一段行（按 `ratio` 行一组拷贝）。`seq[r]` 是窗口槽位打分第 r 行所属来源**行块**
+	 * （`target` = 源视图的 name、`from`/`to` = 源矩阵要高亮的行块闭区间；`null` = 无来源，如空槽）。
+	 * `StepPanel` 按这个表把 `scanRows` 传给目标视图，于是源矩阵上出现一个随窗口 reveal
+	 * **移动的、和拷贝行数一致高的扫描框**（一次拷 `ratio` 行 → 三个矩阵的框都是 `ratio` 行高）。
+	 */
+	scan?: { seq: ({ target: string; from: number; to: number } | null)[] };
+	/**
 	 * 布局：同一 `row` 的多个视图**共用一个动画段，而且进度完全同步**（照样画 `→` 箭头）。
 	 *
 	 * 和 `parallel` 的区别：`parallel` 是"并行分支同时开算"，两边工作量不同时按工作量
@@ -335,9 +358,24 @@ export interface EwiseView extends TensorViewBase {
 }
 
 /**
- * 掩码过程视图：动画演示 j > i 的位置被逐个置为 −∞。
+ * 掩码的一个"来源段"：掩码动画按段**依次**处理（每段逐行处理自己的列区间），
+ * 每段有自己的来源注解（如"滑窗规则"、"indexer 的 top-k"、"sink 恒保留"）。
  *
- * 未处理 → 原值淡显；处理且保留 → 原值；处理且屏蔽 → −∞。
+ * 用于"一张矩阵的掩码来自几个不同规则"的场合（如 V4 融合注意力的
+ * `S（+ sink 列）`：token 列 ← 滑窗、压缩列 ← indexer 的 top-k、sink 列 ← 恒保留）。
+ */
+export interface MaskPart {
+	/** 这一段的列区间（闭区间，含 `to`） */
+	from: number;
+	to: number;
+	/** 来源注解：这一段掩码是谁决定的 */
+	label: string;
+}
+
+/**
+ * 掩码过程视图：动画演示 j > i 的位置被逐个置为 ∅（数学上是 −∞）。
+ *
+ * 未处理 → 原值淡显；处理且保留 → 原值；处理且屏蔽 → ∅（≈ −∞）。
  */
 export interface MaskView extends TensorViewBase {
 	kind: 'mask';
@@ -351,6 +389,11 @@ export interface MaskView extends TensorViewBase {
 	scores: Mat;
 	/** 掩码：1 = 保留，0 = 屏蔽 */
 	mask: Mat;
+	/**
+	 * 可选：掩码按**来源段**依次处理（每段逐行处理自己的列区间、各有注解），
+	 * 而不是整块一起逐行。缺省 = 整块一次逐行（现状）。
+	 */
+	parts?: MaskPart[];
 }
 
 /**
@@ -417,10 +460,31 @@ export interface TransformView extends TensorViewBase {
 	 */
 	highlightCols?: number[];
 	/**
-	 * 可选：输入块先做**逐格掩码**（如因果掩码 j > i → −∞），再做逐行变换。
+	 * 可选：输入块先做**逐格掩码**（如因果掩码 j > i → ∅），再做逐行变换。
 	 * 有了它，掩码和后面的变换共用同一个矩阵块——`S_h` 只画一次。
 	 */
 	preMask?: Mat;
+	/**
+	 * 可选：`preMask` 按**来源段**依次掩码（每段逐行处理自己的列区间、各有来源注解），
+	 * 而不是整块一起逐行。如 V4 融合注意力的 `S（+ sink 列）`：
+	 * token 列 ← 滑窗规则、压缩列 ← indexer 的 top-k、sink 列 ← 恒保留。
+	 * 缺省 = 整块一次逐行掩码（现状）。没有 `preMask` 时忽略。
+	 */
+	preMaskParts?: MaskPart[];
+	/**
+	 * 可选：在**输入块（矩阵）上方**叠一个"来源参考条"——一个静态的小掩码矩阵
+	 * （如 `[S × nE]` 的 top-k 选择矩阵），列左边界对齐输入矩阵的 `colFrom` 列。
+	 *
+	 * 用于"这张矩阵的某一列段掩码是从哪个中间产物来的"（如 V4 融合注意力的压缩列
+	 * ← indexer 的 top-k 选择）。只显示不复播（来源动画在上一步已演过），`view`
+	 * 以完整进度渲染；不参与动画计时、也不参与并排对齐测量。
+	 */
+	topRef?: {
+		/** 参考条视图（`MaskView`：scores + mask + label），progress 固定为 1 */
+		view: MaskView;
+		/** 参考条左边界对齐输入矩阵的哪一列（输入矩阵列坐标） */
+		colFrom: number;
+	};
 	/**
 	 * 可选第二段，接着 `output` 往下做：
 	 *   - 不给 `b`：再做一次**逐行变换**（如 softmax → top-k），`output` 只画一次；

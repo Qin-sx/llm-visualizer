@@ -27,8 +27,16 @@ import { transformCellSize, transformPhaseMs } from '$lib/core/steps';
 		view,
 		progress = 0,
 		compact = false,
-		cellSize: cellSizeProp
-	}: { view: TransformView; progress?: number; compact?: boolean; cellSize?: number } = $props();
+		cellSize: cellSizeProp,
+		scanRows
+	}: {
+		view: TransformView;
+		progress?: number;
+		compact?: boolean;
+		cellSize?: number;
+		/** 外部驱动的扫描行块：高亮输出矩阵的这一段行（如 `-sape` 页源矩阵被窗口槽位打分扫描） */
+		scanRows?: [number, number] | null;
+	} = $props();
 
 	const rows = $derived(view.input.data?.length ?? 0);
 	const cols = $derived(view.input.data?.[0]?.length ?? 0);
@@ -117,9 +125,19 @@ import { transformCellSize, transformPhaseMs } from '$lib/core/steps';
 					name: view.input.name,
 					shape: view.input.shape,
 					scores: view.input.data ?? [],
-					mask: view.preMask
+					mask: view.preMask,
+					// 分来源段时把段表透传给 MaskGrid，由它按段逐行处理列区间
+					...(view.preMaskParts ? { parts: view.preMaskParts } : {})
 				}
 			: null
+	);
+
+	// ── 掩码段的"当前来源段"（分段时进度条要显示正在掩哪一段） ──
+	// MaskGrid 按"总单元 = 段数 × 行数"均分进度，所以段号 = floor(maskP × 段数)
+	const maskSeg = $derived(
+		view.preMaskParts?.length
+			? Math.min(view.preMaskParts.length - 1, Math.floor(maskP * view.preMaskParts.length))
+			: -1
 	);
 </script>
 
@@ -152,6 +170,22 @@ import { transformCellSize, transformPhaseMs } from '$lib/core/steps';
 <div class="tf" class:fit={view.fillWidth} style={compact ? null : `--cap:${cap}px;--last:1fr`}>
 	<!-- 第二段是矩阵乘时整体排成 4 列 2 行：B 在右上、输出块（=左操作数 A）在左下、C 在右下 -->
 	<div class="row" class:chained={!!view.then} class:with-b={!!view.then?.b} class:has-tail={!!view.tail} class:no-input={!!view.hideInput}>
+		<!-- 来源参考条：放在**第一行**（与 V 同行的空位），列左边界对齐输入矩阵的 `colFrom` 列
+		     （如 V4 融合注意力的 top-k 选择矩阵对准 S 的压缩列）——不占第二行的高度，
+		     S 与右侧矩阵的对齐不受影响；absolute 定位也不参与轨道尺寸（S 列不会因此变宽） -->
+		{#if view.topRef}
+			<div class="side top-ref">
+				<div class="ref-top side" style={`left:${view.topRef.colFrom * cellSize}px`}>
+					<div class="head">
+						<span class="nm">{view.topRef.view.matrixName ?? view.topRef.view.name}</span>
+						<span class="sz">[{view.topRef.view.shape.join(' × ')}]</span>
+					</div>
+					<div class="real">{'\u00a0'}</div>
+					<div class="src"><Emph text={view.topRef.view.label ?? '\u00a0'} /></div>
+					<MaskGrid bare view={view.topRef.view} progress={1} {compact} {cellSize} />
+				</div>
+			</div>
+		{/if}
 		{#if view.hideInput}
 			<!-- 输入块不画（`hideInput`）：行首放一个"算子名 + 箭头"的引头，链从输出开始——
 			     输入就是左边那块矩阵（如 `-compress-pool` 吞并 `-compress-kv` 时，v̄ 由 pool 的结果画） -->
@@ -168,15 +202,23 @@ import { transformCellSize, transformPhaseMs } from '$lib/core/steps';
 					     块高两行，对不齐 -->
 					{@render anno(view.input)}
 					<MaskGrid bare view={maskView} progress={maskP} {compact} {cellSize} />
-					<div class="prog">
-						{#if maskP < 1}
-							<span class="now">掩码中 · 已处理 {Math.round(maskP * rows * cols)} / {rows * cols}</span>
+				<div class="prog">
+					{#if maskP < 1}
+						{#if view.preMaskParts?.length}
+							<span class="now"
+								>掩码中 · 段 {maskSeg + 1}/{view.preMaskParts.length}：{view.preMaskParts[maskSeg].label}</span
+							>
 						{:else}
-							<span class="done">
-								掩码完成 · 屏蔽 {view.preMask?.flat().filter((m) => !m).length} 个
-							</span>
+							<span class="now"
+								>掩码中 · 已处理 {Math.round(maskP * rows * cols)} / {rows * cols}</span
+							>
 						{/if}
-					</div>
+					{:else}
+						<span class="done">
+							掩码完成 · 屏蔽 {view.preMask?.flat().filter((m) => !m).length} 个
+						</span>
+					{/if}
+				</div>
 				{:else}
 					{@render anno(view.input)}
 					<MatrixGrid
@@ -203,6 +245,7 @@ import { transformCellSize, transformPhaseMs } from '$lib/core/steps';
 				data={reveal(view.output.data)}
 				{cellSize}
 				highlightRow={mmWork > 0 && mmP > 0 ? mmI : currentRow}
+				scanRows={scanRows}
 				highlightCols={view.tail && !view.then && tailP > 0
 					? view.tail.highlightCols
 					: view.highlightCols}
@@ -439,6 +482,25 @@ import { transformCellSize, transformPhaseMs } from '$lib/core/steps';
 		align-items: baseline;
 		gap: 0.35rem;
 		font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+	}
+	/* 来源参考条：grid 项放在**第一行**（与 V 同行）、absolute 定位到输入矩阵的对应列段。
+	   这样它既不占第二行的高度（S 与右侧矩阵的对齐不受影响）、也不参与轨道尺寸
+	   （S 列不会因此变宽）；表头/注解走同款的 `.head`/`.real`/`.src`，measure ②
+	   会把它们与 V 的注解统一高度 → 矩阵顶边和 V 精确对齐。 */
+	.row.with-b .side.top-ref {
+		grid-area: 1 / 1;
+	}
+	.side.top-ref {
+		position: relative;
+	}
+	.ref-top {
+		position: absolute;
+		top: 0;
+		width: max-content;
+		display: flex;
+		flex-direction: column;
+		gap: 0.15rem;
+		padding: 0.2rem 0.3rem;
 	}
 	.nm {
 		font-size: 0.78rem;

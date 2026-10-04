@@ -141,6 +141,15 @@ export function resolveStepRefs(steps: Step[]): void {
 			// `shape` 的 `note`、`kvcache` 的 `note` 也是给人看的文案，同样要解析
 			// （漏掉的话页面上会直接显示 `{{step:xxx}}`——`verify` 有一条断言盯着）
 			if ((t.kind === 'shape' || t.kind === 'kvcache') && t.note) t.note = fix(t.note);
+			// `preMask` 的**来源段**注解（`preMaskParts` 每段的 label）与**来源参考条**
+			// （`topRef` 的 label）同样是给人看的文案
+			// （如 V4 融合注意力里"压缩列 ← 第 N 步的 top-k 选择"）
+			if (t.kind === 'transform') {
+				if (t.preMaskParts) {
+					for (const p of t.preMaskParts) p.label = fix(p.label) ?? p.label;
+				}
+				if (t.topRef?.view.label) t.topRef.view.label = fix(t.topRef.view.label) ?? t.topRef.view.label;
+			}
 			for (const ref of matRefsOf(t)) {
 				if (ref.label) ref.label = fix(ref.label);
 			}

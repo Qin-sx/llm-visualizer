@@ -667,7 +667,7 @@ export const mla: SemanticsSpec<MlaTrace> = {
 							data: trace.scores[0],
 							realShape: [realSeq, realSeq],
 							label: trace.causal
-								? `← 第 {{step:mla-score}} 步算出的分数，先掩码：j > i → −∞`
+								? `← 第 {{step:mla-score}} 步算出的分数，先掩码：j > i → ∅`
 								: `← 第 {{step:mla-score}} 步算出的分数`
 						},
 						output: {

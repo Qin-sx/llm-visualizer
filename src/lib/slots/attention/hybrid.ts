@@ -34,7 +34,7 @@ import {
 	type Mat,
 	type Vec
 } from '$lib/core/mat';
-import type { MatrixBand, ModelConfigLike, Step } from '$lib/core/types';
+import type { MaskPart, MatrixBand, ModelConfigLike, Step } from '$lib/core/types';
 import { REAL_V4_FLASH } from '$lib/model/config';
 import {
 	compress,
@@ -633,6 +633,41 @@ export function hybridTailSteps(
 		.join('、');
 
 	/**
+	 * 掩码的**来源段**：同一张 `S（+ sink 列）` 里，三块列的掩码来自三个不同规则，
+	 * 动画按段的先后依次播（每段逐行处理自己的列区间）：
+	 * token 列 ← 滑窗规则、压缩列 ← indexer 的 top-k（HCA 无检索则全保留）、sink 列 ← 恒保留。
+	 */
+	const maskParts: MaskPart[] = [
+		{ from: 0, to: S - 1, label: `token 列 ← 滑窗规则（j ≤ i 且 i−j < ${W}）` },
+		...(nE
+			? [
+					trace.indexer
+						? {
+								from: S,
+								to: S + nE - 1,
+								label: `压缩列 ← 第 {{step:${prefix}-indexer-logits}} 步的 top-k 选择（选中才保留）`
+							}
+						: {
+								from: S,
+								to: S + nE - 1,
+								label: '压缩列 ← 写出的条目全保留（HCA 不检索，稠密）'
+							}
+				]
+			: []),
+		{ from: S + nE, to: S + nE, label: 'sink 列 ← 恒保留（每头一个偏置，只进分母）' }
+	];
+
+	/**
+	 * indexer 的 top-k 摊成 0/1（`[S × nE]`）——第 15 页那张"top-k 选择"矩阵的数据，
+	 * 叠在 S（+ sink 列）的**压缩列上方**当来源参考条（`topRef`）。
+	 */
+	const topkMask: Mat | null = trace.indexer
+		? Array.from({ length: S }, (_, i) =>
+				Array.from({ length: nE }, (_, e) => (trace.indexer!.topk[i].includes(e) ? 1 : 0))
+			)
+		: null;
+
+	/**
 	 * K / V 上的**分组框**（`MatRef.bands`）：把"滑窗里的精确 token"和"压缩条目"分成两段框出来。
 	 *
 	 * 两个颜色在 K 和 V 上**一致**：蓝 = 局部精确（滑窗）、琥珀 = 远处压缩（c128）——
@@ -746,9 +781,12 @@ export function hybridTailSteps(
 			diagram: flow(['score', 'sink', 'attn', 'inv']),
 			label:
 				`**一次** softmax 吃掉两类 KV，然后**一条链走到底**：\`S ──softmax──▶ P_h ──×V──▶ O_h ──逆 RoPE──▶ O_h′\`。` +
-				`掩码规则：j > i（因果）、超出滑窗、没被 indexer 选中——三种都置 −∞` +
+				`掩码规则：j > i（因果）、超出滑窗、没被 indexer 选中——三种都置 ∅（≈ −∞：softmax 后权重为 0）` +
 				(nE ? `，但被拒的压缩条目**分数其实还在**（淡显的那些格子）` : '') +
-				`。上一页的分数右边**再接上 sink 那一列**（${colLayout}）——滑窗和压缩历史进的是同一个 softmax，` +
+				`。掩码**分三段依次播**（进度条实时标当前段的来源）：token 列 ← 滑窗规则、` +
+				(nE ? `${trace.indexer ? '压缩列 ← 上一页 top-k 选中的' : '压缩列 ← 写出的全保留（HCA 稠密）'}、` : '') +
+				`sink 列 ← 恒保留——这张矩阵的掩码**完全由这几块来源拼成**。` +
+				`上一页的分数右边**再接上 sink 那一列**（${colLayout}）——滑窗和压缩历史进的是同一个 softmax，` +
 				`不是"各算一遍再合并"；sink 只进分母、没有位置（见下面那块小字）。` +
 				`V 的前 ${S + nE} 行**就是上一页那个 K**（K = V 共用），最后一行是 sink 的 V = 0。` +
 				`链尾那段**逆 RoPE**：每头输出里只有末尾 ${dr} 维（真实 ${R.rope_head_dim} 维）带着 K 的绝对旋转 R(j)，` +
@@ -763,6 +801,24 @@ export function hybridTailSteps(
 					shape: [S, cols],
 					op: 'softmax',
 					preMask: trace.mask,
+					// 掩码按"来源段"依次播：token 列 ← 滑窗规则、压缩列 ← top-k（HCA 全保留）、sink 列 ← 恒保留
+					preMaskParts: maskParts,
+					// top-k 选择矩阵叠在 S 的**压缩列上方**（`colFrom: S`）——
+					// "压缩列掩码从哪来"直接贴在 S 上，不另占一行
+					topRef: trace.indexer && topkMask
+						? {
+								colFrom: S,
+								view: {
+									kind: 'mask',
+									name: `${prefix}-attn-topk`,
+									shape: [S, nE],
+									scores: trace.indexer.logits,
+									mask: topkMask,
+									matrixName: 'top-k 选择',
+									label: `第 {{step:${prefix}-indexer-logits}} 步按 I 每行挑的 top-k（选中才保留）——下方掩码的压缩条目列就是它`
+								}
+							}
+						: undefined,
 					input: ref(
 						'S（+ sink 列）',
 						trace.scores[0],

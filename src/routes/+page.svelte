@@ -17,14 +17,14 @@
 	 * **代表模型**：注意力与 FFN 都按层定下来，所以 UI 上不是"自由组合插件"，
 	 * 而是"选一个代表模型 + 选一层"。非法组合（如 MLA 配 V4）因此根本不存在。
 	 */
-	let modelId = $state(MODELS[0].id);
+	let modelId = $state('v4-flash');
 	const model = $derived(getModel(modelId));
 	const layerList = $derived(Array.from({ length: model.cfg.num_layers }, (_, i) => i));
 	/** 可开关的阶段（由流程声明，见 FlowSpec.stageToggles） */
 	const stageToggles = getFlow('llm').stageToggles ?? LLM_STAGE_TOGGLES;
 
 	/** 模型内可挑的注意力（R1 有 MHA / MLA）；空 = 逐层固定（V4） */
-	let attnId = $state(MODELS[0].attnChoices[0] ?? '');
+	let attnId = $state('');
 	let layer = $state(0);
 
 	/**

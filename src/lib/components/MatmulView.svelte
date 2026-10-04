@@ -563,7 +563,7 @@
 	   每个占一个 `1fr` 列、内容居中——明细框占满整行（右侧空着），4 个乘式均匀铺开 */
 	.bulk {
 		display: grid;
-		gap: 0.4rem 1.5rem;
+		gap: 0.4rem 0.7rem;
 		align-items: center;
 		width: 100%;
 	}
@@ -572,12 +572,12 @@
 		align-items: baseline;
 		justify-content: center;
 		gap: 0.28rem;
-		padding: 0.2rem 0.5rem;
+		padding: 0.2rem 0.4rem;
 		border-radius: 0.3rem;
 		background: #eef2ff;
 		border: 1px solid #a5b4fc;
 		font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-		font-size: 0.68rem;
+		font-size: 0.6rem;
 		color: #475569;
 		white-space: nowrap;
 	}

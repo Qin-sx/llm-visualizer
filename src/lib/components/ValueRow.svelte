@@ -52,7 +52,7 @@
 	);
 
 	function color(v: number): string {
-		if (!Number.isFinite(v)) return '#f1f5f9'; // −∞：留白
+		if (!Number.isFinite(v)) return '#f1f5f9'; // ∅：留白
 		const t = Math.max(-1, Math.min(1, v / maxAbs));
 		const target = t >= 0 ? [79, 70, 229] : [225, 29, 72];
 		const a = Math.abs(t);
@@ -63,7 +63,7 @@
 	}
 
 	const fmt = (v: number) => {
-		if (!Number.isFinite(v)) return '−∞';
+		if (!Number.isFinite(v)) return '∅';
 		return Math.abs(v) >= 100 ? v.toFixed(0) : v.toFixed(2);
 	};
 	const isDark = (v: number) => Number.isFinite(v) && Math.abs(v / maxAbs) > 0.55;

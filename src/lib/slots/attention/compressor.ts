@@ -30,7 +30,7 @@
  * 真实的 indexer 还会对 q/k 做一次 Hadamard 旋转（为了量化友好）——Hadamard 是
  * 正交且对称的，点积里两边一起做会**相互抵消**，所以这里直接省掉。
  */
-import { matmul, randMat, rmsNorm, ropeApply, softmaxRow, topK, type Mat, type Vec } from '$lib/core/mat';
+import { matmul, randMat, rmsNorm, ropeApply, softmaxRow, topK, transpose, type Mat, type Vec } from '$lib/core/mat';
 import type { MatRef, MatrixBand, ModelConfigLike, Step } from '$lib/core/types';
 import { REAL_V4_FLASH } from '$lib/model/config';
 import { v4Diagram, type V4Variant } from './v4-diagram';
@@ -119,7 +119,7 @@ export interface CompressGroup {
 	to: number;
 	/** 这条条目在哪个 token 上才算得出来（组的最后一个 token） */
 	bornAt: number;
-	/** [window × head_dim] 打分 = s + ape；空槽是 −∞ */
+	/** [window × head_dim] 打分 = s + ape；空槽是 ∅（≈ −∞） */
 	scores: Mat;
 	/** [window × head_dim] 权重——**按列**归一化 */
 	weights: Mat;
@@ -141,6 +141,8 @@ export interface CompressorTrace {
 	v: Mat;
 	/** 普通份：打分 */
 	s: Mat;
+	/** 重叠份：上一组的尾巴份打分（重叠窗口才有；否则 null） */
+	sOverlap: Mat | null;
 	/** [nEntries × head_dim] 加权平均的结果 */
 	entries: Mat;
 	/** [nEntries × head_dim] RMSNorm 之后 */
@@ -184,7 +186,7 @@ export function compress(x: Mat, w: CompressorWeights, plan: CompressorPlan): Co
 		const slots = Array.from({ length: window }, (_, j) => slotToken(g, j, plan, S));
 		const bornAt = ratio * (g + 1) - 1;
 
-		// 打分（加 ape）；空槽置 −∞，softmax 后权重自然是 0
+		// 打分（加 ape）；空槽置 ∅（≈ −∞），softmax 后权重自然是 0
 		const scores: Mat = slots.map((t, j) =>
 			Array.from({ length: hd }, (_, c) => (t < 0 ? NEG_INF : scoreAt(j, t)[c] + w.ape[j][c]))
 		);
@@ -224,7 +226,7 @@ export function compress(x: Mat, w: CompressorWeights, plan: CompressorPlan): Co
 	const entriesNorm = entries.map(rmsNormRow);
 	const entriesReady = entriesNorm.map((row, g) => ropeApply(row, groups[g].bornAt, ropeTheta));
 
-	return { plan, x, gate, v, s, entries, entriesNorm, entriesReady, groups };
+	return { plan, x, gate, v, s, sOverlap, entries, entriesNorm, entriesReady, groups };
 }
 
 // ══════════════════════════════════════════════════════════
@@ -233,7 +235,7 @@ export function compress(x: Mat, w: CompressorWeights, plan: CompressorPlan): Co
 export interface IndexerWeights {
 	/** `W_q^B`: [q_lora_rank × index_n_heads·index_head_dim] —— indexer 自己的 Q 上投影 */
 	Wqb: Mat;
-	/** `W_w`: [d_model × index_n_heads] —— 把各头的打分合成一个分数 */
+	/** `W_w`: [d_model × index_n_heads] —— 头权重投影（每头一个标量；与真实模型一致） */
 	Ww: Mat;
 	/** indexer 自己那套压缩器（头维是 `index_head_dim`，比注意力的窄） */
 	comp: CompressorWeights;
@@ -249,9 +251,13 @@ export interface IndexerTrace {
 	qFlat: Mat;
 	/** [S][nH][headDim] */
 	q: number[][][];
-	/** [S × nH] 头权重（已含 `1/√(headDim·nH)` 缩放） */
+	/** [S × nH] 头权重的**原始投影**（`x·W^w`，还没乘 `1/√(headDim·nH)` 缩放）——第 14 页矩阵乘的 C */
+	wRaw: Mat;
+	/** [S × nH] 头权重（已含 `1/√(headDim·nH)` 缩放）：每个 query 一行 w_0、w_1 */
 	headWeights: Mat;
-	/** [S × nEntries] 打分 = Σ_h w_h · ReLU(q_h·k_h)；还没写出来的条目是 −∞ */
+	/** [nH][S × nEntries] 每头的原始 q·k 分数（还没 ReLU、还没按头加权）——打分动画用 */
+	headRaw: number[][][];
+	/** [S × nEntries] 打分 = Σ_h w_h · ReLU(q_h·k_h)；还没写出来的条目是 ∅（≈ −∞） */
 	logits: Mat;
 	/** 每个 query 能看到的条目下标 */
 	candidates: number[][];
@@ -295,17 +301,26 @@ export function runIndexer(
 	);
 	const qFlat = q.map((heads) => heads.flat());
 
-	// ② 头权重：`1/√(headDim·nH)` 是 indexer 的缩放（真实是 `softmax_scale · n_heads^-0.5`）
+	// ② 头权重：先算原始投影 `w_raw = x·W^w`（第 14 页矩阵乘的 C），
+	//     再乘 `1/√(headDim·nH)` 缩放得到 `headWeights`（真实是 `softmax_scale · n_heads^-0.5`）
 	const scale = Math.pow(hd, -0.5) * Math.pow(nH, -0.5);
-	const headWeights = matmul(x, w.Ww).map((row) => row.map((v) => v * scale));
+	const wRaw = matmul(x, w.Ww);
+	const headWeights = wRaw.map((row) => row.map((v) => v * scale));
 
-	// ③ 打分：Σ_h w_h · ReLU(q_h·k_h)
+	// ③ 打分：每头先算原始 q·k（`headRaw`），再 Σ_h w_h · ReLU(·) 合成一个分数
 	const kEntries = compressor.entriesReady;
+	const headRaw: number[][][] = Array.from({ length: nH }, (_, h) =>
+		q.map((heads, i) =>
+			kEntries.map((kv, e) =>
+				compressor.groups[e].bornAt > i ? NEG_INF : dot(heads[h], kv)
+			)
+		)
+	);
 	const logits = q.map((heads, i) =>
 		kEntries.map((kv, e) => {
-			if (compressor.groups[e].bornAt > i) return NEG_INF; // 这条还没写出来
+			if (compressor.groups[e].bornAt > i) return NEG_INF;
 			let acc = 0;
-			for (let h = 0; h < nH; h++) acc += headWeights[i][h] * Math.max(0, dot(heads[h], kv));
+			for (let h = 0; h < nH; h++) acc += headWeights[i][h] * Math.max(0, headRaw[h][i][e]);
 			return acc;
 		})
 	);
@@ -318,7 +333,19 @@ export function runIndexer(
 		topK(row, Math.min(k, row.length)).filter((e) => Number.isFinite(row[e]))
 	);
 
-	return { plan, compressor, qLatent, qFlat, q, headWeights, logits, candidates, topk };
+	return {
+		plan,
+		compressor,
+		qLatent,
+		qFlat,
+		q,
+		wRaw,
+		headWeights,
+		headRaw,
+		logits,
+		candidates,
+		topk
+	};
 }
 
 // ══════════════════════════════════════════════════════════
@@ -342,7 +369,10 @@ export function compressorSteps(
 	cfg: ModelConfigLike,
 	prefix: string,
 	what: string,
-	variant: V4Variant
+	variant: V4Variant,
+	/** 矩阵显示名的后缀：indexer 的压缩传 `^I`（和第 9 页的 `q^I` / `k^I` / `v̄^I` 命名一致），
+	 *  注意力压缩不传（保持 `[v|s]`、`窗口槽位打分`、`v̄` 原名）。 */
+	suffix = ''
 ): Step[] {
 	const plan = trace.plan;
 	const { ratio, overlap, headDim: hd } = plan;
@@ -370,12 +400,12 @@ export function compressorSteps(
 	/** 真实里"值"那一半的总列数（重叠时 = 重叠份 + 主体） */
 	const realValueCols = coff * realPart;
 	const layout = overlap
-		? `前 ${hd} 列 = 重叠份的值、接着 ${hd} 列 = 值、再 ${hd} 列 = 重叠份的打分、最后 ${hd} 列 = 打分`
+		? `前 ${hd} 列 = 重叠份的值 v_overlap、接着 ${hd} 列 = 主体份的值 v、再 ${hd} 列 = 重叠份的打分 s_overlap、最后 ${hd} 列 = 主体份的打分 s（dsv4 记作 [\\,v^{\\text{ov}}\\;|\\;v\\;|\\;s^{\\text{ov}}\\;|\\;s\\,]）`
 		: `前 ${hd} 列 = 值、后 ${hd} 列 = 打分`;
 	/** 把"每一段真实多宽"写成注解：`真实里值 1024 列（每段 512）、打分 1024 列` */
 	const realLayout =
-		`真实里每段都是 ${realPart} 列：**值 ${realValueCols} 列**（${overlap ? `重叠份 ${realPart} + 主体 ${realPart}` : '一份'}）` +
-		`、**打分 ${realValueCols} 列**，合计 ${gateRealCols}`;
+		`真实里每段都是 ${realPart} 列：**值 ${realValueCols} 列**（${overlap ? `v_overlap ${realPart} + v ${realPart}` : '一份'}）` +
+		`、**打分 ${realValueCols} 列**（${overlap ? `s_overlap ${realPart} + s ${realPart}` : '一份'}），合计 ${gateRealCols}`;
 	/**
 	 * `[v | s]` 的"真实尺寸"那行要分段标出值 / 打分各占多少列——
 	 * 这块矩阵画成一个，光看合计的 `[8 × 1024]` 看不出这一步的关键
@@ -383,10 +413,10 @@ export function compressorSteps(
 	 */
 	const realParts = overlap
 		? [
-				{ label: '重叠份的值', cols: realPart },
-				{ label: '值', cols: realPart },
-				{ label: '重叠份的打分', cols: realPart },
-				{ label: '打分', cols: realPart }
+				{ label: 'v_overlap', cols: realPart },
+				{ label: 'v', cols: realPart },
+				{ label: 's_overlap', cols: realPart },
+				{ label: 's', cols: realPart }
 			]
 		: [
 				{ label: '值', cols: realPart },
@@ -420,6 +450,14 @@ export function compressorSteps(
 	 */
 	const apeFull: Mat = Array.from({ length: S }, (_, t) => w.ape[ownSlot(t)]);
 	const sApeFull: Mat = trace.s.map((row, t) => row.map((v, c) => v + apeFull[t][c]));
+	// 尾巴份：token t 被下一组当"上一组尾巴"时，在窗口里占槽位 t%ratio（前 ratio 个槽位）。
+	// 所以它那份 ape 查的是表的前 ratio 行。只有 CSA（重叠）有。
+	const apeTailFull: Mat | null = trace.sOverlap
+		? Array.from({ length: S }, (_, t) => w.ape[t % ratio])
+		: null;
+	const sApeTailFull: Mat | null = trace.sOverlap && apeTailFull
+		? trace.sOverlap.map((row, t) => row.map((v, c) => v + apeTailFull[t][c]))
+		: null;
 	const wFull: Mat = Array.from(
 		{ length: S },
 		(_, t) => trace.groups[Math.floor(t / ratio)].weights[ownSlot(t)]
@@ -432,13 +470,51 @@ export function compressorSteps(
 	 */
 	const prodFull: Mat = trace.v.map((row, t) => row.map((v, c) => v * wFull[t][c]));
 
+	// ── 重叠窗口（CSA）专用：把 4 条窗口各自的值 / 权重 / 乘积按窗口上下堆成一块 ──
+	// 一个窗口 `window` 行，`nE` 条窗口堆起来 = [nE·window × hd]。逐组（window 行一组）揭示。
+	// 不能用 HCA 那种"逐 token 的 8 行"：重叠下同一个 token 会同时出现在两条窗口里、
+	// 权重不同，逐 token 行直接求和算不出条目——所以必须按"窗口"切，每条窗口对应该组自己那 1 条。
+	const winStacked = (pick: (grp: (typeof trace.groups)[number]) => Mat): Mat =>
+		trace.groups.flatMap((grp) => pick(grp));
+	const vWinStacked: Mat = winStacked((grp) => grp.values);
+	const wWinStacked: Mat = winStacked((grp) => grp.weights);
+	/** 每条窗口的 `w ⊙ v` 乘积；每条窗口按列求和 = 那组自己的 1 条压缩条目 */
+	const wvWinStacked: Mat = winStacked((grp) =>
+		grp.values.map((row, j) => row.map((v, c) => v * grp.weights[j][c]))
+	);
+	/** 每条窗口的"槽位打分 + 槽位 ape"（softmax 的输入），堆叠成 [nE·window × hd] */
+	const winScores: Mat = winStacked((grp) => grp.scores);
+	/**
+	 * 窗口槽位打分**每一行**所属的来源**行块**（扫描拼接动画用）：按 `ratio` 行一组拷贝——
+	 * 每条窗口前 `ratio` 行（上一组 2 槽）来自 s_overlap+ape 的 2 行、后 `ratio` 行（自己组 2 槽）
+	 * 来自 s+ape 的 2 行。`seq[r]` 是窗口槽位打分第 r 行所属块的来源
+	 * （`target` = 源视图名、`from`/`to` = 源矩阵那一段行；空槽块为 `null`）。
+	 *
+	 * 所以扫描是**交替**的：先框 s_overlap+ape 的 2 行（上一组）、再框 s+ape 的 2 行（自己组），
+	 * 三个矩阵（源两处 + 窗口槽位打分）的框都保持 2 行高。
+	 */
+	const winScanSeq: ({ target: string; from: number; to: number } | null)[] = trace.groups.flatMap(
+		(grp) => {
+			const tailT = grp.slots.slice(0, ratio).filter((t) => t >= 0);
+			const ownT = grp.slots.slice(ratio).filter((t) => t >= 0);
+			const tailBlock = tailT.length
+				? { target: `${prefix}-sape-tail`, from: Math.min(...tailT), to: Math.max(...tailT) }
+				: null;
+			const ownBlock = ownT.length
+				? { target: `${prefix}-sape-own`, from: Math.min(...ownT), to: Math.max(...ownT) }
+				: null;
+			// 每条窗口 `window` 行：前 `ratio` 行 = tailBlock、后 `ratio` 行 = ownBlock
+			return Array.from({ length: window }, (_, j) => (j < ratio ? tailBlock : ownBlock));
+		}
+	);
+
 	return [
 		// ── 1. gate 投影 → 打分加 ape → softmax（一条线走完） ──
 		{
 			id: `${prefix}-compress-gate`,
 			kind: 'PROJECT',
 			diagram: flow(['x', 'gate', 'w']),
-			label: `压缩的第一步：W_gate 把每个 token 投影出 ${gateCols} 个数（真实 ${gateRealCols} 个）：${layout}——${realLayout}。**框出的打分那几列**就是"这个 token 该占多大权重"的原料：加上一个**按槽位学习的偏置** ape（"在窗口里排第几"本身也是信息），再逐通道 softmax 就得到权重 w（打分和值一样宽，所以每一**列**加起来是 1）。下面拿第 ${nE} 条（覆盖 token ${g.from}~${g.to - 1}）当例子`,
+			label: `压缩的第一步：W_gate 把每个 token 投影出 ${gateCols} 个数（真实 ${gateRealCols} 个）：${layout}——${realLayout}。**框出的打分那几列**（${overlap ? 's_overlap 和 s 两段' : '打分'}）就是"这个 token 该占多大权重"的原料——权重从打分来，这一步先把它算出来；**打分加 ape、再 softmax 成 w** 在下一页全量做（重叠窗口下每个 token 有主体 / 尾巴两份打分）`,
 			formula: overlap
 				? '[\\,v^{\\text{ov}}\\;|\\;v\\;|\\;s^{\\text{ov}}\\;|\\;s\\,]=W_{gate}x,\\qquad w_{j,c}=\\mathrm{softmax}_j\\left(s_{j,c}+a_{j,c}\\right)'
 				: '[\\,v\\;|\\;s\\,]=W_{gate}x,\\qquad w_{j,c}=\\mathrm{softmax}_j\\left(s_{j,c}+a_{j,c}\\right)',
@@ -464,7 +540,7 @@ export function compressorSteps(
 					highlightCols: scoreColList,
 					a: ref('X', trace.x, [S, D], [S, R.d_model], 'input'),
 					b: ref(
-						'W_gate',
+						`W_gate${suffix}`,
 						w.Wgate,
 						[D, gateCols],
 						[R.d_model, gateRealCols],
@@ -475,7 +551,7 @@ export function compressorSteps(
 					),
 					out: {
 						...ref(
-							'[v | s]',
+							`[v | s]${suffix}`,
 							trace.gate,
 							gateShape,
 							[S, gateRealCols],
@@ -483,54 +559,59 @@ export function compressorSteps(
 							// 注解只留最短的一行——真实的分段尺寸由 `realParts` 走"真实尺寸"那一行，
 							// 详细的分段说明在步骤文案里。胶囊是 nowrap + ellipsis 的，
 							// 块宽被限到 9rem 之后长句子会被省略号截掉。
-							overlap ? '← 值 | 打分（各两段）' : '← 值 | 打分'
+							overlap ? '← v_overlap | v | s_overlap | s' : '← 值 | 打分'
 						),
 						realParts
 					}
 				},
-				// 打分 → 加 ape → softmax：**同一行**三块（ape / s + ape / w），每块只有 ${hd} 列。
-				// 放在这一步（而不是下一页）是因为它就是"权重从哪来"的答案。
-				{
-					name: `${prefix}-gate-softmax`,
-					kind: 'transform',
-					row: 1,
-					group: 'chain',
-					// 和左边的矩阵乘同属"放大占满宽度"的那一行（见上），格子要一致
-					cellSize: 24,
-					fillWidth: !overlap,
-					shape: [S, hd],
-					op: '+ s',
-					input: ref(
-						'ape',
-						apeFull,
-						[S, hd],
-						[S, 512],
-						'weight',
-						`← 每个 token 拿到的那份按槽位偏置（表是真实 [${rw} × 512]，同一组里按槽位查表）；8 个 token 一起画`
-					),
-					output: ref(
-						// 名字不带空格：窄块里 `s + ape [8 × 4]` 会折行，表头一高一低矩阵就错开
-						's+ape',
-						sApeFull,
-						[S, hd],
-						[S, 512],
-						undefined,
-						`← 上面框出的打分那几列 + 每个 token 自己那份 ape（空槽是 −∞）`
-					),
-					then: {
-						// 算子名保持最短（"逐通道"写在输出块的注解里）：mid 那一格的宽度
-						// 也是这一行的宽度来源之一
-						op: 'softmax',
-						result: ref(
-							'w',
-							wFull,
-							[S, hd],
-							[S, 512],
-							undefined,
-							'← 在自己那一组那 4 个槽位里逐列归一化，所以每列加起来是 1'
-						)
-					}
-				},
+				// HCA（不重叠）的"打分 → 加 ape → softmax → w"仍在这一页（没有两份打分）：
+				// 每个 token 只投影一份打分，加 ape 再 softmax 就得到 w。
+				// CSA（重叠）把它挪到下一页（-sape，两份打分全量），所以这里不画。
+				...(overlap
+					? []
+					: [
+							{
+								name: `${prefix}-gate-softmax`,
+								kind: 'transform' as const,
+								row: 1,
+								group: 'chain',
+								// 和左边的矩阵乘同属"放大占满宽度"的那一行（见上），格子要一致
+								cellSize: 24,
+								fillWidth: !overlap,
+								shape: [S, hd],
+								op: '+ s',
+								input: ref(
+									`ape${suffix}`,
+									apeFull,
+									[S, hd],
+									[S, 512],
+									'weight',
+									`← 每个 token 拿到的那份按槽位偏置（表是真实 [${rw} × 512]，同一组里按槽位查表）；8 个 token 一起画`
+								),
+								output: ref(
+									// 名字不带空格：窄块里 `s + ape [8 × 4]` 会折行，表头一高一低矩阵就错开
+									`s+ape${suffix}`,
+									sApeFull,
+									[S, hd],
+									[S, 512],
+									undefined,
+									`← 上面框出的打分那几列 + 每个 token 自己那份 ape（空槽是 ∅，数学上 ≈ −∞）`
+								),
+								then: {
+									// 算子名保持最短（"逐通道"写在输出块的注解里）：mid 那一格的宽度
+									// 也是这一行的宽度来源之一
+									op: 'softmax',
+									result: ref(
+										`w${suffix}`,
+										wFull,
+										[S, hd],
+										[S, 512],
+										undefined,
+										'← 在自己那一组那 4 个槽位里逐列归一化，所以每列加起来是 1'
+									)
+								}
+							}
+						]),
 				{
 					name: `${prefix}-gate-note`,
 					kind: 'shape',
@@ -543,61 +624,206 @@ export function compressorSteps(
 			]
 		},
 
-		// ── 2. 组内加权平均（权重已经在上一页算好了）→ 归一化 + RoPE（同一行、先后算） ──────
+		// ── 1.5 打分 + ape → softmax → w（重叠窗口 CSA 专用）：逐 token 双份全量 ──
+		...(overlap
+			? [
+					{
+						id: `${prefix}-sape`,
+						kind: 'SOFTMAX' as const,
+						diagram: flow(['gate', 'w']),
+						label: `打分加 ape → 拼接成窗口槽位打分 → softmax → w：重叠窗口下每个 token 投影出**两份打分**——主体份 s（在自己那组里用）和尾巴份 s_overlap（被下一组当"上一组尾巴"用），各加**各自槽位**的 ape。左边上、下两条链：s_overlap+ape 在上、s+ape 在下。**右边中间**的「窗口槽位打分」**从空开始**，两个框分别扫过 s_overlap+ape（每条窗口"上一组 2 槽"）和 s+ape（"自己 2 槽"）逐渐拼接填满（窗口重叠 → token 会重复出现）；填满后才在每条窗口那 4 个槽位上逐通道 softmax → w，供下一步加权平均用`,
+						formula:
+							's^{\\text{ov}}+a^{\\text{ov}},\\ s+a\\ \\Rightarrow\\ w_{j,c}=\\mathrm{softmax}_j(s_{j,c}+a_{j,c})',
+						tensors: [
+							// Row 0, 左列 group 'scores'：s_overlap + ape（上）、s + ape（下）——**并行**同时算
+							// （相关计算：都汇向同一个窗口槽位打分，所以 `noHsep` 列间画箭头而不是虚线）
+							{
+								name: `${prefix}-sape-tail`,
+								kind: 'transform' as const,
+								row: 0,
+								group: 'scores',
+								parallel: true,
+								noHsep: true,
+								shape: [S, hd],
+								op: '+ape',
+								input: ref(
+									`s_overlap${suffix}`,
+									trace.sOverlap!,
+									[S, hd],
+									[S, R.head_dim],
+									'latent',
+									'← 尾巴份打分（被下一组当尾巴时用）'
+								),
+								output: ref(
+									`s_overlap+ape${suffix}`,
+									sApeTailFull!,
+									[S, hd],
+									[S, R.head_dim],
+									undefined,
+									`← 加尾巴槽位的 ape（表的前 ${ratio} 行）`
+								)
+							},
+							{
+								name: `${prefix}-sape-own`,
+								kind: 'transform' as const,
+								row: 0,
+								group: 'scores',
+								parallel: true,
+								shape: [S, hd],
+								op: '+ape',
+								input: ref(
+									`s${suffix}`,
+									trace.s,
+									[S, hd],
+									[S, R.head_dim],
+									'latent',
+									'← 主体份打分（在自己组里用）'
+								),
+								output: ref(
+									`s+ape${suffix}`,
+									sApeFull,
+									[S, hd],
+									[S, R.head_dim],
+									undefined,
+									`← 加主体槽位的 ape（表的后 ${ratio} 行）`
+								)
+							},
+							// Row 0, 右列：窗口槽位打分（matrix，**从空**逐列拼接填）→ softmax → w
+							{
+								name: `${prefix}-sape-w-in`,
+								kind: 'matrix' as const,
+								row: 0,
+								group: 'win-in',
+								vcenter: true,
+								shape: [nE * window, hd],
+								cellSize: 22,
+								animated: true,
+								revealOrder: 'row' as const,
+								overview: `窗口槽位打分${suffix}`,
+								title: `窗口槽位打分${suffix}`,
+								scan: { seq: winScanSeq },
+								data: winScores,
+								label: `← **初始为空**：框交替扫过 s_overlap+ape 与 s+ape 的行，**逐行**拼接填出来（每条窗口 4 槽 = 上一组 2 槽用 s_overlap、自己 2 槽用 s）`
+							},
+							{
+								name: `${prefix}-sape-w`,
+								kind: 'transform' as const,
+								row: 0,
+								group: 'win-out',
+								shape: [nE * window, hd],
+								cellSize: 22,
+								op: 'softmax',
+								hideInput: true,
+								input: ref(
+									`窗口槽位打分${suffix}`,
+									winScores,
+									[nE * window, hd],
+									[nE * rw, R.head_dim],
+									'latent',
+									'← 左边拼接填出的窗口槽位打分（初始为空）'
+								),
+								output: ref(
+									`w${suffix}`,
+									wWinStacked,
+									[nE * window, hd],
+									[nE * rw, R.head_dim],
+									'weight',
+									'← 每条窗口那 4 个槽位逐通道 softmax（每列和为 1）；供下一步 w ⊙ v 用'
+								)
+							},
+							{
+								name: `${prefix}-sape-splice-note`,
+								kind: 'shape' as const,
+								wide: true,
+								shape: [S, hd],
+								note: `**拼接动画**：窗口槽位打分**从空开始**，两个框分别扫过左边上下两条链的输出（s_overlap+ape 和 s+ape）的各槽位填进去——每条窗口 4 槽 = 上一组 2 槽（s_overlap+ape）+ 自己 2 槽（s+ape）；因为窗口重叠，同一个 token 会同时出现在两条窗口里、两处的槽位打分不同`
+							}
+						]
+					}
+				]
+			: []),
+
+		// ── 2. 组内加权平均 → 归一化 + RoPE（同一行、先后算） ──
+		//    · HCA（不重叠）：权重 w 上一页算好，这一步把 v 与 w 整块拷过来 ewise；
+		//    · CSA（重叠）：权重 w 在上一页（-sape）算好，这一步把 4 条窗口各 4 行堆成
+		//      一块逐组揭示（只用 w，不再算它）。
 		{
 			id: `${prefix}-compress-pool`,
-			kind: 'SOFTMAX',
+			kind: 'SOFTMAX' as const,
 			diagram: flow(['gate', 'w', 'entries', 'ckv']),
 			label: overlap
-				? `组内加权平均：**权重 w 上一页已经算好了**（打分 + ape → softmax），这一步只用它：把这一条压缩条目看的 ${window} 个 token 的**值**逐元素乘上各自那一列的权重，再**按列**加起来——${window} 个 token 就变成 1 条。下面拿第 ${nE} 条（覆盖 token ${g.from}~${g.to - 1}）当例子`
-				: `组内加权平均：**权重 w 上一页已经算好了**（打分 + ape → softmax）。这一步把上一页那两块**整块拷过来**——${S} 个 token 的**值 v** 和**权重 w** 各一块，逐元素相乘得到 **w ⊙ v**（每个 token 的值乘上它那一列的权重），再**按列**加起来：一条压缩条目只看其中 ${ratio} 个 token。**${S} 个 token 分成 ${nE} 组、一组一组算**——先算第 1 组（前 ${ratio} 个 token）得到第 1 条，再算第 2 组（后 ${ratio} 个）得到第 2 条；框出的就是**正在算的那一组**。**同一行右边紧接着做归一化 + RoPE**：v̄ 先过 RMSNorm 再按它所在组的最后一个 token 做 RoPE，就成了可用的${what}（先后计算，不并发）`,
+				? `组内加权平均（**权重 w 上一页已经算好**）：把 ${nE} 条窗口**一起画**（一条 4 行，窗口互相重叠：token 会同时出现在两条窗口里、权重不同）。**分两步**：先算 **w ⊙ v**——每条窗口的值逐元素乘上各自那一列的权重（框出的 4 行 = 正在算的那条窗口）；再**按列求和**得 v̄——每条窗口的 ${window} 个槽位加起来变成那 1 条压缩条目（先出完第 1 条、再第 2 条…）`
+				: `组内加权平均：**权重 w 上一页已经算好了**（打分 + ape → softmax）。这一步把上一页那两块**整块拷过来**——${S} 个 token 的**值 v** 和**权重 w** 各一块。**分两步**：先算 **w ⊙ v**——每个 token 的值乘上它那一列的权重（${S} 个 token 分成 ${nE} 组、一组一组乘，框出的就是**正在算的那一组**）；再**按列求和**得 v̄——每组那 ${ratio} 个 token 加起来变成 1 条（先出第 1 条、再第 2 条）。**同一行右边紧接着做归一化 + RoPE**：v̄ 先过 RMSNorm 再按它所在组的最后一个 token 做 RoPE，就成了可用的${what}（先后计算，不并发）`,
 			formula:
 				'\\bar v_c=\\sum_j w_{j,c}\\,v_{j,c},\\qquad \\mathrm{kv}=\\mathcal{R}\\!\\left(\\mathrm{RMSNorm}(\\bar v),\\; pos_{group}\\right)',
 			tensors: [
 				// "乘过权重"要画成**矩阵**，不能只写一行小字说"已经乘过"。
 				//
-				// 不重叠时用 `ewise`（逐元素二元运算）视图：`w` 右上、`v` 左下、`w ⊙ v` 右下
-				// （和矩阵乘同一个 2×2）；`v` 取上一步 `[v | s]` 的值那几列、`w` 取上一步 softmax 的结果。
-				// 框出的是**这条条目看的窗口那几行**，按列加起来就是 `v̄`。
+				// 不重叠（HCA）用 `ewise`：`w` 右上、`v` 左下、`w ⊙ v` 右下（和矩阵乘同一个 2×2）；
+				// 两个操作数都从上一页的完整矩阵拷过来，**8 个 token 全画**、逐组（ratio 行一组）揭示。
 				//
-				// 重叠窗口（CSA）下**不能用这个写法**：一个 token 会同时出现在两条窗口里
-				// （自己组的主体、上一组的尾巴），两处权重不同，所以"逐 token 的 8 行"加起来
-				// 不等于 `v̄`——那边保持"窗口那 `window` 行"的写法。
+				// 重叠窗口（CSA）下不能用"逐 token 的 8 行"：一个 token 会同时出现在两条窗口里、
+				// 权重不同，逐 token 行直接求和算不出条目。所以把 **4 条窗口**各 `window` 行上下
+				// 堆成一块 `[nE·window × hd]`，同样用 `ewise` + `groupRows = window` 逐组揭示，
+				// 每条窗口的 window 行按列加 = 那组自己的 1 条。权重 w 在上一页（-sape）算好，
+				// 这里只用它（`w`），不再画 softmax。
 				//
 				// 这一页**不再标 `fillWidth`**：两个块并排（`compact`），
 				// 格子就按并排的统一值 22 走（`matmulCellSize` / `matrix` 视图都是它）——
 				// 一行里两块边长一致，行高才一致、矩阵才对齐。
 				...(overlap
 					? [
+							// ── 4 条窗口的 w ⊙ v → 各按列求和 → v̄ → kv ──
 							{
-								name: `${prefix}-pool-prod`,
-								kind: 'matrix' as const,
+								name: `${prefix}-pool-ewise`,
+								kind: 'ewise' as const,
 								row: 1,
-								sync: true,
-								shape: [window, hd],
-								animated: true,
-								revealOrder: 'col' as const,
-								// 没有具名操作数可画，总览靠这两个 `overview` 把它画成 `w ⊙ v → v̄`
-								overview: 'w ⊙ v',
-								data: g.values.map((row, j) => row.map((v, c) => v * g.weights[j][c])),
-								label: `← 权重 × 值（**逐元素**）：每个 token 的值乘上它那一列的权重${g.slots.some((t) => t < 0) ? '；空槽权重为 0' : ''}（真实 [${rw} × 512]）`
+								cellSize: 22,
+								shape: [nE * window, hd],
+								// 总览节点：`w ⊙ v → v̄`（`ewise` 没有具名操作数，靠 `overview` 声明）
+								overview: `w ⊙ v${suffix}`,
+								op: '⊙',
+								a: ref(
+									`v${suffix}`,
+									vWinStacked,
+									[nE * window, hd],
+									[nE * rw, R.head_dim],
+									'latent',
+									`← ${nE} 条窗口各自的值（**一条 4 行**，重叠 token 会在两条窗口里重复出现，权重不同）`
+								),
+								b: ref(
+									`w${suffix}`,
+									wWinStacked,
+									[nE * window, hd],
+									[nE * rw, R.head_dim],
+									'weight',
+									'← 每条窗口自己归一化出来的逐槽位权重（4 条窗口堆成一块）'
+								),
+								out: ref(
+									`w ⊙ v${suffix}`,
+									wvWinStacked,
+									[nE * window, hd],
+									[nE * rw, R.head_dim],
+									undefined,
+									`← 逐元素相乘；**框出的那 4 行 = 正在算的那条窗口**；下一步再把每列加起来 = 那 1 条 v̄`
+								),
+								// 逐组揭示：一条窗口一组（window 行），组内按列走
+								groupRows: window,
+								revealOrder: 'col' as const
 							},
 							{
 								name: `${prefix}-pool-result`,
 								kind: 'matrix' as const,
 								row: 1,
-								sync: true,
-								cellSize: 26, // 与同一行的 w⊙v / kv 链一致（c128 4-5-6-7 放大）
+								cellSize: 26,
 								shape: [nE, hd],
 								animated: true,
-								revealOrder: 'col' as const,
-								// 整列一起出现：上游那一列加完，这一列才亮（换算式见 MatrixGrid.revealGroup）
-								revealGroup: window,
-								highlightRows: [nE - 1, nE - 1] as [number, number],
-								overview: 'v̄',
-								title: 'v̄',
+								// 分开算：w ⊙ v 整块算完，v̄ 才一行一组地出（`groupRows = window`：一条窗口 = 1 行）
+								groupRows: window,
+								overview: `v̄${suffix}`,
+								title: `v̄${suffix}`,
 								data: trace.entries,
-								label: `← 整段序列压出的 ${nE} 条压缩条目（就是后面 ${nE} 条压缩 KV；上面算的是第 ${nE} 条）`
+								label: `← ${nE} 条压缩条目：w ⊙ v 算完后，每条 = 它那 ${window} 个槽位按列求和（先出完第 1 条、再第 2 条…）`
 							}
 						]
 					: [
@@ -605,14 +831,13 @@ export function compressorSteps(
 								name: `${prefix}-pool-ewise`,
 								kind: 'ewise' as const,
 								row: 1,
-								sync: true,
 								cellSize: 26, // 与同一行的 v̄ / kv 链一致（c128 4-5-6-7 放大）
 								shape: [S, hd],
 								// 总览节点：`w ⊙ v → v̄`（`ewise` 没有具名操作数，靠 `overview` 声明）
-								overview: 'w ⊙ v',
+								overview: `w ⊙ v${suffix}`,
 								op: '⊙',
 								a: ref(
-									'v',
+									`v${suffix}`,
 									trace.v,
 									[S, hd],
 									[S, R.head_dim],
@@ -620,7 +845,7 @@ export function compressorSteps(
 									'← 上一页 `[v | s]` 的值那几列'
 								),
 								b: ref(
-									'w',
+									`w${suffix}`,
 									wFull,
 									[S, hd],
 									[S, R.head_dim],
@@ -628,12 +853,12 @@ export function compressorSteps(
 									'← 上一页 softmax 出来的权重'
 								),
 								out: ref(
-									'w ⊙ v',
+									`w ⊙ v${suffix}`,
 									prodFull,
 									[S, hd],
 									[S, R.head_dim],
 									undefined,
-									`← 逐元素相乘（**框出的那一组**就是正在算的：${ratio} 个 token → 1 条）`
+									`← 逐元素相乘（**框出的那一组**就是正在算的：${ratio} 个 token）；下一步按列加起来 = 那 1 条 v̄`
 								),
 								// **逐组**揭示：8 个 token 分成 2 组，先算前 4 个（第 1 条）、再算后 4 个（第 2 条）。
 								// 框不再写死（原来固定框最后那一组当例子），而是跟着动画走到"正在算的那一组"。
@@ -645,17 +870,16 @@ export function compressorSteps(
 								name: `${prefix}-pool-result`,
 								kind: 'matrix' as const,
 								row: 1,
-								sync: true,
 								cellSize: 26, // 与同一行的 w⊙v / kv 链一致（c128 4-5-6-7 放大）
 								shape: [nE, hd],
 								animated: true,
-								// 上游每算完"一组的一列"就出一格（`groupRows` 与上面那个视图同一个数字），
-								// 逐格按**行序**出现：先出完第 1 条，再出第 2 条
+								// 分开算：w ⊙ v 整块算完，v̄ 才一行一组地出（`groupRows = ratio`），
+								// 逐行按行序出现：先出完第 1 条，再出第 2 条
 								groupRows: ratio,
-								overview: 'v̄',
-								title: 'v̄',
+								overview: `v̄${suffix}`,
+								title: `v̄${suffix}`,
 								data: trace.entries,
-								label: `每 ${ratio} 个 token 压成 1 条（按列 Σ）`
+								label: `w ⊙ v 算完后，每 ${ratio} 个 token 压成 1 条（按列 Σ）`
 							}
 						]),
 				// 归一化 + RoPE：与 w⊙v / v̄ **同一行**，但**先后计算**
@@ -672,7 +896,7 @@ export function compressorSteps(
 					hideInput: true,
 					op: 'RMSNorm',
 					input: ref(
-						'v̄',
+						`v̄${suffix}`,
 						trace.entries,
 						[nE, hd],
 						[nE, 512],
@@ -680,7 +904,7 @@ export function compressorSteps(
 						`← 左边 pool 按列加出来的 ${nE} 条压缩条目（每条 = 组内 ${window} 个 token 的值的加权平均）`
 					),
 					output: ref(
-						'v̄~',
+						`v̄~${suffix}`,
 						trace.entriesNorm,
 						[nE, hd],
 						[nE, 512],
@@ -715,7 +939,7 @@ export function compressorSteps(
 	];
 }
 
-/** 检索器的两步：给压缩条目打分 → 每个 query 挑 top-k */
+/** 检索器的三步：准备 q^I → 打分（q·k → ReLU → 按头加权 → I）→ 挑 top-k */
 export function indexerSteps(
 	trace: IndexerTrace,
 	w: IndexerWeights,
@@ -735,13 +959,26 @@ export function indexerSteps(
 	const picked = trace.topk[i];
 	const ic = trace.compressor;
 	const flow = (active: string[]) => v4Diagram(variant, active);
+	/** 每行挑出的 top-k 摊成 0/1（[S × nE]）——"谁进注意力"的选择矩阵；
+	 *  下一页（注意力）掩码里的**压缩条目列**就是它，逐行揭示选中 / 落选 / 未出生 */
+	const topkMask: Mat = Array.from({ length: S }, (_, i) =>
+		Array.from({ length: nE }, (_, e) => (trace.topk[i].includes(e) ? 1 : 0))
+	);
+	/** 每头的 ReLU 分数（[nH][S × nE] = max(0, 原始 q·k)）——打分流程的第二步 */
+	const headRelu = trace.headRaw.map((h) => h.map((row) => row.map((v) => Math.max(0, v))));
+	/** 每头 ReLU 分数 × 该头权重（逐行乘标量）——乘法动画输出与 Σ 项都用它 */
+	const hwProd = (h: number) =>
+		headRelu[h].map((row, i) => row.map((v) => v * (trace.headWeights[i][h] ?? 0)));
+	/** w_0 / w_1 画成 [S × nE]：每头一个标量按行广播到 4 个条目列（权重按头、条目共用） */
+	const wBroadcast = (h: number) =>
+		trace.headWeights.map((r) => Array.from({ length: nE }, () => r[h]));
 
 	return [
 		{
-			id: `${prefix}-indexer-score`,
+			id: `${prefix}-indexer-q`,
 			kind: 'PROJECT',
 			diagram: flow(['cqn', 'itop']),
-			label: `indexer 用**自己那套**压缩 KV 打分——它的头维只有 ${hd}（真实 ${R.index_head_dim}，注意力的压缩 KV 是 ${R.head_dim}），因为这里只需要"够分辨谁重要"，不需要精确。压缩方式与上面**完全一样**（同一个 W_gate + 逐通道加权平均 + RMSNorm + RoPE），只是头维换了。每个 query 对每条压缩条目算 ${nH} 个头的 q·k 再过 ReLU，最后按头加权求和成一个分数`,
+			label: `这一页先把 indexer 的**查询 q^I** 准备好——从共用的 c_Q~ 升维（头更窄，每头 ${hd} 维，真实 ${R.index_head_dim} vs 注意力的 ${R.head_dim}，够分辨谁重要就行），按头过 RoPE。**k^I（压缩 KV）上一页已经压好**，下一页用它把打分流程完整走一遍：q^I·k^I → ReLU → 按头加权求和 → 打分 I → top-k`,
 			formula: 'I_{i,e}=\\sum_h w_{i,h}\\,\\mathrm{ReLU}\\!\\left(q^{I}_{i,h}\\cdot k^{I}_{e}\\right)',
 			tensors: [
 				{
@@ -762,29 +999,7 @@ export function indexerSteps(
 						[S, nH * hd],
 						[S, R.index_n_heads * R.index_head_dim],
 						'head',
-						'← 按头过 RoPE 之后参与打分'
-					)
-				},
-				{
-					name: `${prefix}-indexer-k`,
-					kind: 'transform',
-					shape: [nE, hd],
-					op: 'RMSNorm → RoPE',
-					input: ref(
-						'v̄^I',
-						ic.entries,
-						[nE, hd],
-						[nE, R.index_head_dim],
-						undefined,
-						'← indexer 自己压出来的条目（和上面同一套压缩，只是头维更窄）'
-					),
-					output: ref(
-						'压缩 KV（indexer 用）',
-						ic.entriesReady,
-						[nE, hd],
-						[nE, R.index_head_dim],
-						'cache',
-						`← ${nE} 条；它们只负责"排序"，不参与注意力`
+						`← ${nH} 头 × 每头 ${hd} 维（真实 ${R.index_n_heads} × ${R.index_head_dim}；注意力的 Q 是 ${cfg.num_heads} 头 × ${cfg.head_dim} 维——indexer 的头更窄），按头过 RoPE 后参与打分`
 					)
 				},
 				{
@@ -792,44 +1007,267 @@ export function indexerSteps(
 					kind: 'shape',
 					wide: true,
 					shape: [nE, hd],
-					note: `两套压缩 KV 各有各的 W_gate：注意力那套负责"被看"（宽 ${R.head_dim}），indexer 这套只负责"排序"（宽 ${R.index_head_dim}）。打分高的条目才会进入注意力，其余连 KV 都不必读——省的就是这部分`
+					note: `两套压缩 KV 各有各的 W_gate：注意力那套负责"被看"（宽 ${R.head_dim}），indexer 这套只负责"排序"（宽 ${R.index_head_dim}）。打分高的条目才会进入注意力，其余连 KV 都不必读——省的就是这部分。**下一步**用这份 q^I 对 k^I 完整打分`
 				}
 			]
 		},
 		{
-			id: `${prefix}-indexer-topk`,
-			kind: 'SELECT',
-			diagram: flow(['itop']),
-			label: `打分 → 挑 top-${k}：每个 query 只让 ${k} 条压缩条目参与注意力（真实 ${R.index_topk} 条）。序列还没走到那么远时，那条条目**根本还没写出来**（−∞），自然选不上。于是"远距离历史"从"全看"变成"检索着看"——这是 CSA 比 HCA 更省的地方`,
-			formula:
-				'\\mathcal{S}_i=\\mathrm{top\\text{-}}k\\left(\\{I_{i,e}\\}_{e\\,:\\;born(e)\\,\\le\\,i}\\right)',
+			id: `${prefix}-indexer-score`,
+			kind: 'MATMUL',
+			diagram: flow(['cqn', 'itop']),
+			label: `打分第一步，先看**单个头**怎么算分：head 0 的 q^I_0 对每条压缩条目算点积 q^I_0 · k^Iᵀ（左边这块矩阵乘，和注意力 S = Q·Kᵀ 同套路）→ **头0分数**；紧挨着过 **ReLU**（右边：负数截成 0，负的相似度不算数）→ **头0 ReLU 分数**。head 1 同样算一份；**两头的 ReLU 分数怎么按 w_h 加权合成打分矩阵 I、再挑 top-k，在下面两页**`,
+			formula: 'r_{i,e}=\\mathrm{ReLU}\\!\\left(q^{I}_{0,i}\\cdot k^{I}_{e}\\right)\\ \\text{（单头演示）}',
 			tensors: [
+				// ① 单头打分：q^I_0 · k^Iᵀ → 头 0 原始分数（和注意力 S = Q·Kᵀ 同套路），
+				// 右边紧跟 ReLU 链（`hideInput`：头0分数 由矩阵乘的 C 画，不重画）
 				{
-					name: `${prefix}-indexer-logits`,
-					kind: 'matrix',
+					name: `${prefix}-indexer-score-mm`,
+					kind: 'matmul',
+					row: 1,
+					group: 'mm',
+					cellSize: 40,
 					shape: [S, nE],
-					data: trace.logits,
-					animated: true,
-					// 总览节点：`I → top-k`（这两个视图都没有具名操作数，靠 `overview` 声明）
-					overview: 'I',
-					label: `打分矩阵 [${S} × ${nE}]：行 = query、列 = 压缩条目。−∞ = 那条还没写出来。真实是「序列长度 × 序列长度/压缩比」（16 万序列、128 倍压缩时是一千多条），也是不物化的中间量，所以这里没有"真实尺寸"那一行`,
-					highlight: [i, picked[0] ?? 0]
+					a: ref(
+						'q^I_0',
+						trace.qFlat.map((r) => r.slice(0, hd)),
+						[S, hd],
+						[S, R.index_head_dim],
+						'head',
+						`← head 0 的 q（每头 ${hd} 维，真实 ${R.index_head_dim}）；这里演示 head 0，head 1 同样算一份`
+					),
+					b: ref(
+						'k^Iᵀ',
+						transpose(ic.entriesReady),
+						[hd, nE],
+						[R.index_head_dim, nE],
+						'head',
+						`← indexer 那套压缩 KV 转置（**第 {{step:${prefix}-idx-compress-pool}} 步已经压好**，每列一条压缩条目）`
+					),
+					out: ref(
+						'头0分数',
+						trace.headRaw[0],
+						[S, nE],
+						[S, nE],
+						'result',
+						`← head 0 的 q·k 原始分数。**∅ = 那条条目还没写出来**，token 0 时一条都还没写完、第一行整行是 ∅；之后每过一个块尾，右侧多亮一格。`
+					),
+					scaleNote: '每头 q·k（无缩放）'
+				},
+				// ② 单头 ReLU：头0分数 → ReLU → 头0 ReLU 分数（负数截成 0；输入由左边矩阵乘画）
+				{
+					name: `${prefix}-indexer-relu`,
+					kind: 'transform',
+					row: 1,
+					group: 'relu',
+					cellSize: 40,
+					shape: [S, nE],
+					op: 'ReLU',
+					hideInput: true,
+					input: ref(
+						'头0分数',
+						trace.headRaw[0],
+						[S, nE],
+						[S, nE],
+						'result',
+						'← 左边矩阵乘算出的 头0分数（负数会被截成 0）'
+					),
+					output: ref(
+						'头0 ReLU 分数',
+						headRelu[0],
+						[S, nE],
+						[S, nE],
+						'result',
+						'← 负数截成 0（和左边一对比就看得出）；head 1 也这样 ReLU，在下一页 Σ 里一起加权'
+					)
+				}
+			]
+		},
+		{
+			id: `${prefix}-indexer-w`,
+			kind: 'MATMUL',
+			diagram: flow(['itop']),
+			label: `打分第二步：**头权重 w_h 从哪来**——每个 query 的隐藏状态 x 过一个小的投影 W^w（d_model → ${nH} 头，每头一个标量），得到**原始投影 w_raw**（左边矩阵乘）；紧挨着**乘 1/√(hd·nH) 缩放**（右边，和注意力 softmax_scale 同一个道理）→ **w_h**。然后**每头的 ReLU 分数乘上它自己的权重**：head 0 乘 w_0、head 1 乘 w_1（下面两块**同时算**——一个 token 的两头互不相干），得到 头0·w0 和 头1·w1`,
+			formula:
+				'w_{i,h}=\\mathrm{scale}\\,\\left(x_i W^{w}\\right)_h,\\qquad \\hat r^{(h)}_{i,e}=w_{i,h}\\,\\mathrm{ReLU}\\!(q^{I}_{i,h}\\cdot k^{I}_{e})',
+			tensors: [
+				// ① 原始投影：x · W^w → w_raw [S × nH]（还没缩放）
+				{
+					name: `${prefix}-indexer-w-mm`,
+					kind: 'matmul',
+					row: 1,
+					group: 'wmm',
+					cellSize: 34,
+					shape: [S, nH],
+					a: ref('x', ic.x, [S, D], [S, R.d_model], 'input', '← 每个 query 的隐藏状态（和 Q/KV 同一份 x）'),
+					b: ref(
+						'W^w',
+						w.Ww,
+						[D, nH],
+						[R.d_model, R.index_n_heads],
+						'weight',
+						`← 头权重的投影（真实 ${R.d_model} → ${R.index_n_heads} 头，每头一个标量）`
+					),
+					out: ref(
+						'w_raw',
+						trace.wRaw,
+						[S, nH],
+						[S, R.index_n_heads],
+						'weight',
+						`← 原始投影（还没缩放）；右边乘 1/√(hd·nH) 才是 w_h`
+					)
+				},
+				// ② 缩放：× 1/√(hd·nH) → w_h（输入由左边矩阵乘的 C 画，不重画）
+				{
+					name: `${prefix}-indexer-w-scale`,
+					kind: 'transform',
+					row: 1,
+					group: 'wscale',
+					cellSize: 34,
+					shape: [S, nH],
+					op: '× 1/√(hd·nH)',
+					hideInput: true,
+					input: ref(
+						'w_raw',
+						trace.wRaw,
+						[S, nH],
+						[S, R.index_n_heads],
+						'weight',
+						'← 左边矩阵乘算出的 原始投影'
+					),
+					output: ref(
+						'w_h',
+						trace.headWeights,
+						[S, nH],
+						[S, R.index_n_heads],
+						'weight',
+						`← 缩放后：每头一个权重、每个 query 一行（w_0、w_1）；供下面两个乘法用`
+					)
+				},
+				// ③ 每头 ReLU 分数 × 自己的权重（**并列**：parallel + 同一行 → 同一个动画单元同时算，
+				//     列间画浅色虚线而不是箭头——两个乘法互不相干，只是各自独立地算）。
+				//     ewise：w_0 / w_1 按行广播成 [S × nE] 的可见权重矩阵
+				{
+					name: `${prefix}-indexer-mul-0`,
+					kind: 'ewise',
+					row: 2,
+					group: 'mul0',
+					parallel: true,
+					cellSize: 34,
+					shape: [S, nE],
+					op: '⊙',
+					a: ref(
+						'头0 ReLU 分数',
+						headRelu[0],
+						[S, nE],
+						[S, nE],
+						'result',
+						`← 第 {{step:${prefix}-indexer-score}} 步的 头0 ReLU 分数`
+					),
+					b: ref(
+						'w_0',
+						wBroadcast(0),
+						[S, nE],
+						[S, nE],
+						'weight',
+						`← w_h 的第 0 列（head 0 的权重）按行广播成 ${nE} 格——权重按头，${nE} 个条目共用同一个 w_0`
+					),
+					out: ref(
+						'头0·w0',
+						hwProd(0),
+						[S, nE],
+						[S, nE],
+						'result',
+						'← 逐格相乘：每个条目的 ReLU 分数 × 这一行的 w_0'
+					)
 				},
 				{
-					name: `${prefix}-indexer-topk-row`,
-					kind: 'row',
-					wide: true,
-					shape: [nE],
-					overview: 'top-k',
-					data: trace.logits[i],
-					labels: trace.logits[i].map((v, e) =>
-						picked.includes(e)
-							? `条目 ${e}：被选中`
-							: Number.isFinite(v)
-								? `条目 ${e}：分数不够，没选上`
-								: `条目 ${e}：还没写出来`
+					name: `${prefix}-indexer-mul-1`,
+					kind: 'ewise',
+					row: 2,
+					group: 'mul1',
+					parallel: true,
+					cellSize: 34,
+					shape: [S, nE],
+					op: '⊙',
+					a: ref(
+						'头1 ReLU 分数',
+						headRelu[1],
+						[S, nE],
+						[S, nE],
+						'result',
+						`← 第 {{step:${prefix}-indexer-score}} 步的 头1 ReLU 分数`
 					),
-					label: `最后一行（token ${i}）的打分：选中的是条目 ${picked.join('、')}`
+					b: ref(
+						'w_1',
+						wBroadcast(1),
+						[S, nE],
+						[S, nE],
+						'weight',
+						`← w_h 的第 1 列（head 1 的权重）按行广播成 ${nE} 格`
+					),
+					out: ref(
+						'头1·w1',
+						hwProd(1),
+						[S, nE],
+						[S, nE],
+						'result',
+						'← 逐格相乘：每个条目的 ReLU 分数 × 这一行的 w_1'
+					)
+				}
+			]
+		},
+		{
+			id: `${prefix}-indexer-logits`,
+			kind: 'ADD',
+			diagram: flow(['itop']),
+			label: `打分第三步：把两头的乘积**加起来**得到打分矩阵 I——Σ 那块逐行把两项相加：头0·w0 + 头1·w1 = 这一格的打分（负的原始分数早在 ReLU 里变 0，不会拖累总分）；I 算完**紧接着挑 top-k**（旁边那一列，逐行揭示）：每个 query 从自己那一行挑分数最高的 top-${k} 条（真实 ${R.index_topk} 条；还没写出来的那条是 ∅，自然选不上）——选中的才进入下一步的注意力，其余连 KV 都不必读。演示最后一行（token ${i}）：选中的是条目 ${picked.join('、')}；"远距离历史"从"全看"变成"检索着看"，这是 CSA 比 HCA 更省的地方`,
+			formula:
+				'I_{i,e}=\\hat r^{(0)}_{i,e}+\\hat r^{(1)}_{i,e},\\qquad \\mathcal{S}_i=\\mathrm{top\\text{-}}k\\left(\\{I_{i,e}\\}_{e\\,:\\;born(e)\\,\\le\\,i}\\right)',
+			tensors: [
+				// ① 求和：头0·w0 + 头1·w1 → 打分矩阵 I（逐行动画）
+				// 与下面的 top-k 选择**同一行并排**（`row: 1`）：算完 I 紧接着挑 top-k，
+				// 中间用 `→` 连起来——"从打分到选择"是一条连续的链
+				{
+					name: `${prefix}-indexer-logits-sum`,
+					kind: 'sum',
+					row: 1,
+					shape: [S, nE],
+					terms: [
+						{
+							name: '头0·w0',
+							shape: [S, nE],
+							realShape: [S, nE],
+							data: hwProd(0),
+							label: `← 第 {{step:${prefix}-indexer-w}} 步的 头0·w0`
+						},
+						{
+							name: '头1·w1',
+							shape: [S, nE],
+							realShape: [S, nE],
+							data: hwProd(1),
+							label: `← 第 {{step:${prefix}-indexer-w}} 步的 头1·w1`
+						}
+					],
+					result: {
+						name: 'I',
+						shape: [S, nE],
+						realShape: [S, nE],
+						data: trace.logits,
+						label: `打分矩阵 I：逐行相加（头0·w0 + 头1·w1 = 这一格的打分；∅ = 那条条目还没写出来）`
+					}
+				},
+				// ② 挑 top-k：把**每行**的选择摊成 0/1（选中 = 保留、其余 ∅），逐行揭示——
+				//    这就是下一页注意力掩码里"压缩条目列"的直接来源（每行从 I 里挑的 top-k）
+				{
+					name: `${prefix}-indexer-topk-mask`,
+					kind: 'mask',
+					row: 1,
+					shape: [S, nE],
+					overview: 'top-k',
+					scores: trace.logits,
+					mask: topkMask,
+					matrixName: 'top-k 选择',
+					label: `每个 query 从 I 自己的那一行挑分数最高的 top-${k} 条（真实 ${R.index_topk} 条）：**选中才保留（显示分数）、其余置 ∅**（还没写出来的那条是 ∅，自然选不上）。逐行揭示；最后一行（token ${i}）选中的是条目 ${picked.join('、')}。**这张 0/1 矩阵就是下一步注意力掩码里"压缩条目列"的直接来源**`
 				}
 			]
 		}

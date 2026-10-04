@@ -18,7 +18,7 @@ export function maxAbsOf(data: (number | null)[][] | Mat): number {
 
 export function cellColor(v: number | null, maxAbs: number): string {
 	if (v === null) return '#ffffff'; // 尚未算出
-	if (!Number.isFinite(v)) return '#f1f5f9'; // −∞
+	if (!Number.isFinite(v)) return '#f1f5f9'; // ∅（数学上是 −∞，softmax 后权重为 0）
 	const t = Math.max(-1, Math.min(1, v / maxAbs));
 	const target = t >= 0 ? [79, 70, 229] : [225, 29, 72];
 	const a = Math.abs(t) * 0.88;
@@ -35,6 +35,6 @@ export function cellTextColor(v: number | null, maxAbs: number): string {
 
 export function fmtCell(v: number | null): string {
 	if (v === null) return '';
-	if (!Number.isFinite(v)) return '−∞';
+	if (!Number.isFinite(v)) return '∅';
 	return Math.abs(v) >= 100 ? v.toFixed(0) : v.toFixed(2);
 }

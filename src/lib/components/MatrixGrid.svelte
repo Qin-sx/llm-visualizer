@@ -24,6 +24,7 @@
 		groupRows = 0,
 		busyCol: busyColProp,
 		busyRows,
+		scanRows,
 		onCellClick
 	}: {
 		/** null 表示该格尚未算出 */
@@ -94,6 +95,13 @@
 		 * 另外那几组也跟着变黄，看起来像在加它们。不传就覆盖整个矩阵高度。
 		 */
 		busyRows?: [number, number];
+		/**
+		 * 扫描行块：正在被"扫描拼接"的那一段行（浅蓝色行框，随动画移动，闭区间）。
+		 *
+		 * 与 `highlightRow`（琥珀，表示"正在计算这一行"）区分：这里是"这一整段行正在被拼进
+		 * 另一块矩阵"（如 `-sape` 页窗口槽位打分逐行填时，源矩阵上被拷贝的那一段行）。
+		 */
+		scanRows?: [number, number] | null;
 		onCellClick?: (i: number, j: number) => void;
 	} = $props();
 
@@ -251,6 +259,22 @@
 			stroke="#0ea5e9"
 			stroke-width="2"
 			pointer-events="none"
+		/>
+	{/if}
+
+	<!-- 扫描行块（浅蓝）：这一段行正在被拼进另一块矩阵（随动画移动） -->
+	{#if scanRows && scanRows[0] >= 0 && scanRows[1] < rows}
+		<rect
+			x="0"
+			y={scanRows[0] * cellSize}
+			width={w}
+			height={(scanRows[1] - scanRows[0] + 1) * cellSize}
+			fill="#38bdf8"
+			opacity="0.18"
+			stroke="#38bdf8"
+			stroke-width="2"
+			pointer-events="none"
+			data-scan-rows="1"
 		/>
 	{/if}
 

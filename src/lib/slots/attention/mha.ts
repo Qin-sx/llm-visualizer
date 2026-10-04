@@ -290,7 +290,7 @@ export const mha: SemanticsSpec<MhaTrace> = {
 			{
 				id: 'attn-mask-softmax-av',
 				kind: 'MASK',
-				label: `掩码 → softmax → 用权重对 V 加权求和：先把 j > i 的分数置为 −∞，再逐行归一化成权重 P，最后 P·V 得到本头的输出。三段按先后顺序算`,
+				label: `掩码 → softmax → 用权重对 V 加权求和：先把 j > i 的分数置为 ∅（≈ −∞：softmax 后权重为 0），再逐行归一化成权重 P，最后 P·V 得到本头的输出。三段按先后顺序算`,
 				formula:
 					'S_{ij}=-\\infty\\ (j>i)\\ \\Rightarrow\\ P_{h,ij}=\\frac{e^{S_{ij}}}{\\sum_{j}e^{S_{ij}}}\\ \\Rightarrow\\ O_h=P_hV_h',
 				tensors: [
@@ -307,7 +307,7 @@ export const mha: SemanticsSpec<MhaTrace> = {
 							data: trace.scores[0],
 							realShape: [realSeq, realSeq],
 							label: trace.causal
-								? `← 第 {{step:attn-score}} 步算出的分数，先掩码：j > i → −∞`
+								? `← 第 {{step:attn-score}} 步算出的分数，先掩码：j > i → ∅`
 								: `← 第 {{step:attn-score}} 步算出的分数`
 						},
 						output: {

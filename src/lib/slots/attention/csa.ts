@@ -64,9 +64,24 @@ export const csa: SemanticsSpec<HybridTrace> = {
 			...(trace.compress
 				? compressorSteps(trace.compress, w.comp!, ctx.cfg, prefix, '注意力的压缩 KV', variant)
 				: []),
-			// indexer 自己的压缩 KV（更窄，只负责"排序"）+ 打分与 top-k
-			...(trace.indexer ? indexerSteps(trace.indexer, w.idx!, ctx.cfg, prefix, variant) : []),
-			...hybridTailSteps(trace, w, ctx.cfg, plan, prefix)
+		// indexer 自己的压缩 KV（更窄，只负责"排序"）——复用同一套 compressorSteps，
+		// 只是 `what` 换成"indexer 的打分对象"、prefix 换 `csa-idx`（避免和注意力的压缩步骤 id 撞车）、
+		// 矩阵名加 `^I` 后缀（`[v|s]^I` / `窗口槽位打分^I` / `v̄^I`，和第 9 页的 q^I / k^I 命名一致）
+		...(trace.indexer
+			? [
+					...compressorSteps(
+						trace.indexer.compressor,
+						w.idx!.comp,
+						ctx.cfg,
+						'csa-idx',
+						'indexer 的打分对象',
+						variant,
+						'^I'
+					),
+					...indexerSteps(trace.indexer, w.idx!, ctx.cfg, prefix, variant)
+				]
+			: []),
+		...hybridTailSteps(trace, w, ctx.cfg, plan, prefix)
 		];
 	}
 };

@@ -651,7 +651,7 @@ export const mlaAbsorb: ImplementationSpec<MlaAbsorbTrace> = {
 							data: trace.scores[0],
 							realShape: [realSeq, realSeq],
 							label: trace.causal
-								? `← 第 {{step:abs-score}} 步算出的分数，先掩码：j > i → −∞`
+								? `← 第 {{step:abs-score}} 步算出的分数，先掩码：j > i → ∅`
 								: `← 第 {{step:abs-score}} 步算出的分数`
 						},
 						output: {
