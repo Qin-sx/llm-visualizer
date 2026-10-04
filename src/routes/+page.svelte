@@ -3,7 +3,7 @@
 	import '$lib/flows'; // 副作用：注册全部流程
 	import { untrack } from 'svelte';
 	import { getFlow, getSemantics, listImplementationsFor } from '$lib/core/registry';
-	import { getModel, layerKind, MODELS } from '$lib/model/config';
+	import { getModel, layerKind, MODELS, type ModelSpec } from '$lib/model/config';
 	import { buildLlmFlow, LLM_STAGE_TOGGLES, type LlmFlowResult } from '$lib/flows/llm';
 	import { createPlayer, type Player } from '$lib/core/timeline';
 	import { animateHandoffs, resetHandoffs } from '$lib/core/handoff';
@@ -20,8 +20,17 @@
 	let modelId = $state('v4-flash');
 	const model = $derived(getModel(modelId));
 	const layerList = $derived(Array.from({ length: model.cfg.num_layers }, (_, i) => i));
-	/** 可开关的阶段（由流程声明，见 FlowSpec.stageToggles） */
-	const stageToggles = getFlow('llm').stageToggles ?? LLM_STAGE_TOGGLES;
+	/**
+	 * 可开关的阶段（由流程声明，见 FlowSpec.stageToggles）。
+	 *
+	 * **Residual 只在 R1 显示**：V4 的残差是 Hyper-Connections（还没做），
+	 * 现在给 V4 一个点了没反应的开关只会误导。
+	 */
+	const togglesFor = (m: ModelSpec) =>
+		(getFlow('llm').stageToggles ?? LLM_STAGE_TOGGLES).filter(
+			(t) => t.id !== 'residual' || m.residual
+		);
+	const stageToggles = $derived(togglesFor(model));
 
 	/** 模型内可挑的注意力（R1 有 MHA / MLA）；空 = 逐层固定（V4） */
 	let attnId = $state('');
@@ -37,11 +46,17 @@
 	});
 
 	/**
-	 * 关掉的阶段：默认按流程声明的 `defaultOn` 来（Attention / FFN-MoE 开，
+	 * 关掉的阶段：默认按流程声明的 `defaultOn` 来（Attention / FFN-MoE / Residual 开，
 	 * Embedding / LM Head 关）。关掉的阶段**根本不进流程**——步骤、流程图节点、
 	 * 总览都跟着消失，而不是渲染出来再藏起来。
+	 * 只按**初始模型**初始化一次（换模型后的差异由 `togglesFor` 的派生过滤处理）。
 	 */
-	let offStages = $state<string[]>(stageToggles.filter((t) => !t.defaultOn).map((t) => t.id));
+	// svelte-ignore state_referenced_locally
+	let offStages = $state<string[]>(
+		togglesFor(getModel(modelId))
+			.filter((t) => !t.defaultOn)
+			.map((t) => t.id)
+	);
 	const toggleStage = (id: string) =>
 		(offStages = offStages.includes(id) ? offStages.filter((x) => x !== id) : [...offStages, id]);
 
@@ -248,7 +263,7 @@
 			/>
 		{:else if steps.length === 0}
 			<p class="loading">
-				四个阶段都关掉了。至少打开一个（见上方「展示阶段」），才有动画可看。
+				所有阶段都关掉了。至少打开一个（见上方「展示阶段」），才有动画可看。
 			</p>
 		{:else}
 			<p class="loading">加载中…</p>

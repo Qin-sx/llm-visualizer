@@ -11,7 +11,7 @@ export type Vec = number[];
 export type Mat = number[][];
 
 // ── 插槽与表示深度 ────────────────────────────────────────
-export type SlotId = 'embedding' | 'attention' | 'kvcache' | 'ffn-moe' | 'lm-head';
+export type SlotId = 'embedding' | 'attention' | 'kvcache' | 'ffn-moe' | 'residual' | 'lm-head';
 
 /**
  * L0 叙述级：一个节点 + 公式 + 一段文字

@@ -282,7 +282,7 @@ assert(
 
 assert(
 	JSON.stringify(demo.stages.map((s) => s.id)) ===
-		JSON.stringify(['embedding-lookup', 'attention', 'ffn-moe', 'lm-head']),
+		JSON.stringify(['embedding-lookup', 'attention', 'ffn-moe', 'residual', 'lm-head']),
 	`流水线节点由流程提供：${demo.stages.map((s) => s.title).join(' → ')}`
 );
 assert(
@@ -300,8 +300,11 @@ assert(cursor === demo.steps.length, `区段无缝覆盖全部 ${demo.steps.leng
 
 const segOf = new Map(demo.segments.map((s) => [s.stage, s]));
 for (const st of demo.stages) {
-	const seg = segOf.get(st.id);
-	assert(!!seg && seg.to > seg.from, `阶段 ${st.id} 有自己的步骤（${seg ? seg.to - seg.from : 0} 步）`);
+	// 阶段可以有**多段**区间（Residual 拆在两处），步数按段求和
+	const own = demo.segments
+		.filter((s) => s.stage === st.id)
+		.reduce((n, s) => n + (s.to - s.from), 0);
+	assert(own > 0, `阶段 ${st.id} 有自己的步骤（${own} 步）`);
 }
 assert(
 	demo.segments.reduce((n, s) => n + (s.to - s.from), 0) === demo.steps.length,
@@ -316,8 +319,8 @@ assert(
 );
 assert(
 	demo.stages.filter((s) => s.scope === 'model').length === 2 &&
-		demo.stages.filter((s) => s.scope === 'layer').length === 2,
-	'2 个模型级阶段（Embedding / LM Head）+ 2 个层级阶段（Attention / FFN-MoE）'
+		demo.stages.filter((s) => s.scope === 'layer').length === 3,
+	'2 个模型级阶段（Embedding / LM Head）+ 3 个层级阶段（Attention / FFN-MoE / Residual）'
 );
 
 console.log('\n[Embedding 查表]');
@@ -2724,6 +2727,7 @@ console.log('\n[DeepSeek V4 混合注意力：SWA / CSA / HCA]');
 				topkView.scores === idx.logits && topkView.shape[0] === S && topkView.shape[1] === cs.nE,
 				'选择矩阵画的就是 I 的打分（[S × nE]）：选中的格子保留分数、其余 ∅'
 			);
+			// 选择矩阵 = 每行 top-k 摊成的 0/1，且 == 注意力掩码的压缩列（逐格对得上）
 			let selOk = true;
 			for (let i = 0; i < S; i++)
 				for (let e = 0; e < cs.nE; e++) {
@@ -2734,6 +2738,7 @@ console.log('\n[DeepSeek V4 混合注意力：SWA / CSA / HCA]');
 		}
 	}
 
+	// ── 掩码按"来源段"依次播（token 列 ← 滑窗 / 压缩列 ← top-k / sink ← 恒保留） ──
 	{
 		const attnStep = csaDemo.steps.find((s) => s.id === 'csa-attn')!;
 		const chain = attnStep.tensors.find((t) => t.kind === 'transform')!;
@@ -2792,6 +2797,7 @@ console.log('\n[DeepSeek V4 混合注意力：SWA / CSA / HCA]');
 			);
 		}
 	}
+	// HCA 无 indexer：压缩段的来源注解是"全保留"；SWA 无压缩列：只有 token + sink 两段
 	{
 		const hcaChain = hcaDemo.steps
 			.find((s) => s.id === 'hca-attn')!
@@ -2916,14 +2922,14 @@ console.log('\n[阶段开关]');
 	// 关掉的阶段**根本不进流程**：步骤、流程图节点、总览都跟着消失。
 	// 因为没有任何跨阶段的 `{{step:...}}` 引用，所以关掉一整段不会把标签解析成 `?`。
 	const toggles = getFlow('llm').stageToggles ?? [];
-	assert(toggles.length === 4, `流程声明了 ${toggles.length} 个可开关的阶段`);
+	assert(toggles.length === 5, `流程声明了 ${toggles.length} 个可开关的阶段`);
 	assert(
-		toggles.map((t) => t.id).join(',') === 'embedding-lookup,attention,ffn-moe,lm-head',
+		toggles.map((t) => t.id).join(',') === 'embedding-lookup,attention,ffn-moe,residual,lm-head',
 		`阶段顺序与流程一致：${toggles.map((t) => t.title).join(' → ')}`
 	);
 	assert(
-		toggles.filter((t) => t.defaultOn).map((t) => t.id).join(',') === 'attention,ffn-moe',
-		`默认开的是 Attention 与 FFN/MoE（Embedding / LM Head 默认关）：${toggles
+		toggles.filter((t) => t.defaultOn).map((t) => t.id).join(',') === 'attention,ffn-moe,residual',
+		`默认开的是 Attention / FFN-MoE / Residual（Embedding / LM Head 默认关）：${toggles
 			.filter((t) => t.defaultOn)
 			.map((t) => t.title)
 			.join(' / ')}`
@@ -2936,11 +2942,14 @@ console.log('\n[阶段开关]');
 	);
 	const total = allOn.steps.length;
 
-	// 逐个关掉：该阶段的步骤与流程图节点都要消失，其余保持不变
+	// 逐个关掉：该阶段的步骤与流程图节点都要消失，其余保持不变。
+	// 注意一个阶段可以有**多段**区间（Residual 拆在注意力后 / FFN 后两处），
+	// 关掉时是这几段步数**之和**一起消失。
 	for (const t of toggles) {
 		const off = buildLlmFlow({ attnId: 'mla', ffnId: 'auto', layer: MOE_LAYER, off: [t.id] });
-		const seg = allOn.segments.find((s) => s.stage === t.id)!;
-		const own = seg.to - seg.from;
+		const own = allOn.segments
+			.filter((s) => s.stage === t.id)
+			.reduce((n, s) => n + (s.to - s.from), 0);
 		assert(
 			off.steps.length === total - own,
 			`关掉 ${t.title}：少了它那 ${own} 步（${total} → ${off.steps.length}）`
@@ -2967,7 +2976,7 @@ console.log('\n[阶段开关]');
 		p.destroy();
 	}
 
-	// 只留默认开的那两个：流程应当就是"Attention + FFN/MoE"
+	// 只留默认开的那三个：流程应当就是"Attention + FFN/MoE + Residual"
 	const defaults = buildLlmFlow({
 		attnId: 'mla',
 		ffnId: 'auto',
@@ -2975,11 +2984,11 @@ console.log('\n[阶段开关]');
 		off: toggles.filter((t) => !t.defaultOn).map((t) => t.id)
 	});
 	assert(
-		defaults.stages.map((s) => s.id).join(',') === 'attention,ffn-moe',
-		`按默认开关跑出来就是两段：${defaults.stages.map((s) => s.title).join(' → ')}（${defaults.steps.length} 步）`
+		defaults.stages.map((s) => s.id).join(',') === 'attention,ffn-moe,residual',
+		`按默认开关跑出来就是三段：${defaults.stages.map((s) => s.title).join(' → ')}（${defaults.steps.length} 步）`
 	);
 
-	// 四个全关：不报错，流程为空（UI 会提示"至少打开一个"）
+	// 五个全关：不报错，流程为空（UI 会提示"至少打开一个"）
 	const none = buildLlmFlow({
 		attnId: 'mla',
 		ffnId: 'auto',
@@ -2988,7 +2997,7 @@ console.log('\n[阶段开关]');
 	});
 	assert(
 		none.steps.length === 0 && none.stages.length === 0 && none.segments.length === 0,
-		'四个阶段全关掉时流程为空（步骤 / 节点 / 区间都是空的），不抛错'
+		'五个阶段全关掉时流程为空（步骤 / 节点 / 区间都是空的），不抛错'
 	);
 }
 

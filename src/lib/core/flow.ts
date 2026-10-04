@@ -108,6 +108,11 @@ export function buildFlow(outputs: StageOutput[]): BuiltFlow {
 	const segments: FlowSegment[] = [];
 
 	for (const { stage, steps: own } of outputs) {
+		// 同一个阶段 id 可以出现**多次**（如 Residual 拆在注意力后 / FFN 后两处）：
+		// 流程图节点只留**一个**，位置取最后一次出现（Residual 的节点因此落在 FFN 之后、
+		// 当"整层收尾"）；每段区间各记一条，步骤高亮 / 总览仍按真实位置。
+		const dup = stages.findIndex((s) => s.id === stage.id);
+		if (dup >= 0) stages.splice(dup, 1);
 		stages.push(stage);
 		segments.push({
 			stage: stage.id,

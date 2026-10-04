@@ -212,6 +212,11 @@ export interface ModelSpec {
 	attnChoices: string[];
 	/** 层选择器上每层的标注（如 `dense` / `MoE` / `SWA` / `C4` / `C128`） */
 	layerLabels: string[];
+	/**
+	 * 层故事里是否包含"残差加回"阶段（`x + 子层输出`，每层两步）。
+	 * R1 是普通残差；V4 的残差是 Hyper-Connections（还没做），先不开。
+	 */
+	residual: boolean;
 }
 
 /** R1：前 2 层 dense FFN、其余 MoE；注意力可选 MHA / MLA */
@@ -224,7 +229,8 @@ export const R1_MODEL: ModelSpec = {
 	ffnByLayer: ['dense-ffn', 'dense-ffn', 'deepseek-moe', 'deepseek-moe'],
 	attnByLayer: [null, null, null, null],
 	attnChoices: ['mha', 'mla'],
-	layerLabels: ['dense', 'dense', 'MoE', 'MoE']
+	layerLabels: ['dense', 'dense', 'MoE', 'MoE'],
+	residual: true
 };
 
 /** V4-Flash：全 MoE；注意力逐层固定（纯 SWA / CSA / HCA） */
@@ -237,7 +243,9 @@ export const V4_FLASH_MODEL: ModelSpec = {
 	ffnByLayer: ['deepseek-moe', 'deepseek-moe', 'deepseek-moe', 'deepseek-moe'],
 	attnByLayer: ['swa', 'swa', 'csa', 'hca'],
 	attnChoices: [],
-	layerLabels: ['SWA', 'SWA', 'C4', 'C128']
+	layerLabels: ['SWA', 'SWA', 'C4', 'C128'],
+	// V4 的残差是 Hyper-Connections（4 条并行残差流），还没做——先不开普通残差阶段
+	residual: false
 };
 
 export const MODELS: ModelSpec[] = [R1_MODEL, V4_FLASH_MODEL];

@@ -23,6 +23,12 @@ export interface LayerTrace {
 	ffnId: string;
 	attention: SlotTrace;
 	ffn: SlotTrace;
+	/** 层输入 x（**未归一化**）——残差加回的那条"主残差流"本身 */
+	xIn: Mat;
+	/** 注意力输出加回之后（`x + attn_out`） */
+	attnResidual: Mat;
+	/** FFN 输出加回之后（`x₁ + ffn_out`，= 下一层的输入 / LM Head 的输入） */
+	ffnResidual: Mat;
 }
 
 export interface ModelTrace {
@@ -63,12 +69,16 @@ export function forward(
 	for (let l = 0; l < cfg.num_layers; l++) {
 		const kind = layerKind(cfg, l);
 		const attn = resolveAttn(l);
+		// 层输入：残差流本身。子层看的是它的归一化版，加回的是它原样——
+		// 所以"残差加回"是 `x + sublayer(rmsNorm(x))`，不是 `norm(x) + sublayer(...)`。
+		const xIn = x;
 
 		// ── Attention（前置 RMSNorm + 残差）──────────────
 		const attnIn = rmsNorm(x);
 		const attnCtx: LayerCtx = { layer: l, cfg, w: weights.slots[attn.weightKey]?.[l] };
 		const attnTrace = attn.compute(attnIn, attnCtx);
 		x = matAdd(x, attnTrace.out);
+		const attnResidual = x;
 
 		// ── FFN / MoE（前置 RMSNorm + 残差）─────────────
 		const ffnId = resolveFfn(l);
@@ -77,6 +87,7 @@ export function forward(
 		const ffnCtx: LayerCtx = { layer: l, cfg, w: weights.slots[ffnId]?.[l] };
 		const ffnTrace = ffnSpec.compute(ffnIn, ffnCtx);
 		x = matAdd(x, ffnTrace.out);
+		const ffnResidual = x;
 
 		layers.push({
 			layer: l,
@@ -84,7 +95,10 @@ export function forward(
 			attnId: attn.semantics.id,
 			ffnId,
 			attention: attnTrace,
-			ffn: ffnTrace
+			ffn: ffnTrace,
+			xIn,
+			attnResidual,
+			ffnResidual
 		});
 	}
 
