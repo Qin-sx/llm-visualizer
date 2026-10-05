@@ -46,8 +46,9 @@
 	const reveal = (d: number[][] | undefined, done: number) =>
 		d ? d.map((row, i) => (i < done ? row : row.map(() => null))) : [];
 
-	// 链式相加要塞 4 列矩阵（项 / routed / shared / y），格子得小一号才排得进一行
-	const cellSize = $derived(compact || view.then ? 24 : 34);
+	// 链式相加要塞 4 列矩阵（项 / routed / shared / y），格子得小一号才排得进一行；
+	// `view.cellSize` 允许视图自己要求放大 / 缩小（如 mHC 的 pre 混合页并排时要和变换对齐）
+	const cellSize = $derived(view.cellSize ?? (compact || view.then ? 24 : 34));
 	/** 列的宽度上限：**最宽那块矩阵的宽 + 1/4**（原则 ④）；最后一列不封顶（原则 ⑤） */
 	const cap = $derived(
 		(Math.max(...view.terms.map((t) => t.shape[1] ?? 0), view.result.shape[1] ?? 0) * cellSize * 5) / 4
@@ -93,7 +94,29 @@
 					</div>
 					<div class="real">{realLabel(term) ?? '\u00a0'}</div>
 					<div class="src"><Emph text={term.label ?? '\u00a0'} /></div>
-					<MatrixGrid data={term.data ?? []} {cellSize} highlightRow={currentRow} />
+					<!--
+						每项右侧竖挂的"系数列"（`termSide`，如 mHC 的 pre 门控列）：
+						和该项的矩阵**并排**、同一行逐行揭示——"这一项乘的系数"直接画出来。
+						矩阵放侧列**第一个**、标签在矩阵**下方**：这样 `.mrow` 顶边对齐的是两块矩阵本身，
+						pre 列不会被自己的标签顶下去、和 r_0 错开。
+					-->
+					<div class="mrow">
+						<MatrixGrid data={term.data ?? []} {cellSize} highlightRow={currentRow} />
+						{#if view.termSide?.[j]}
+							<div class="side-col">
+								<MatrixGrid
+									data={reveal(view.termSide![j].data ?? [], doneRows)}
+									{cellSize}
+									highlightRow={currentRow}
+								/>
+								<div class="head">
+									<span class="nm">{view.termSide![j].name}</span>
+									<span class="sz">[{view.termSide![j].shape.join(' × ')}]</span>
+								</div>
+								<div class="src"><Emph text={view.termSide![j].label ?? '\u00a0'} /></div>
+							</div>
+						{/if}
+					</div>
 				</div>
 			{/each}
 		</div>
@@ -265,6 +288,18 @@
 		gap: 0.15rem;
 		/* 所有块给同样的内边距——这样并排时矩阵顶边能对齐 */
 		padding: 0.2rem 0.3rem;
+	}
+	/* 项的矩阵 + 右侧系数列（`termSide`）横向并排；列宽 1 行、矩阵 8 行，各自按内容排 */
+	.mrow {
+		display: flex;
+		align-items: flex-start;
+		gap: 0.4rem;
+	}
+	.side-col {
+		display: flex;
+		flex-direction: column;
+		align-items: flex-start;
+		gap: 0.15rem;
 	}
 	.head {
 		display: flex;

@@ -16,6 +16,7 @@
 import { mulberry32, randMat, type Mat } from '$lib/core/mat';
 import { allImplementations, allSemantics } from '$lib/core/registry';
 import { attnIdsFor, ffnIdsOf, pluginsOf, R1_MODEL, type ModelSpec } from './config';
+import { makeHcHeadParams, makeHcMixParams, type HcWeights } from './hc';
 
 export interface Weights {
 	/** [vocab_size, d_model] —— Embedding 阶段的词表矩阵 */
@@ -24,6 +25,11 @@ export interface Weights {
 	lmHead: Mat;
 	/** 插件 id → 每层的权重包（即 `ctx.w`） */
 	slots: Record<string, unknown[]>;
+	/**
+	 * V4 的 mHC 残差权重（`cfg.hc_mult` 存在才初始化）。它不是插件——残差过程属于模型骨架，
+	 * 按模型声明，所以放在这里而不是 `slots` 里。
+	 */
+	hc?: HcWeights;
 }
 
 /** 由字符串派生一个稳定整数（FNV-1a），用于给每个插件分出独立的随机流 */
@@ -68,6 +74,24 @@ export function initWeights(spec: ModelSpec = R1_MODEL, seed?: number): Weights 
 	return {
 		embed: randMat(cfg.vocab_size, cfg.d_model, mulberry32(streamSeed(s, 'embed'))),
 		lmHead: randMat(cfg.d_model, cfg.vocab_size, mulberry32(streamSeed(s, 'lm-head'))),
-		slots
+		slots,
+		// mHC（V4）：每层一组（attn / ffn 各自的 pre 参数）+ 模型级 hc_head。
+		// 与插件同一约定：'hc-mix' 一条流跨层往下走（层内先 attn 后 ffn）；head 单独一条流。
+		hc: cfg.hc_mult
+			? {
+					layers: Array.from({ length: cfg.num_layers }, () => {
+						const rnd = mulberry32(streamSeed(s, 'hc-mix'));
+						return {
+							attn: makeHcMixParams(rnd, cfg.hc_mult!, cfg.d_model),
+							ffn: makeHcMixParams(rnd, cfg.hc_mult!, cfg.d_model)
+						};
+					}),
+					head: makeHcHeadParams(
+						mulberry32(streamSeed(s, 'hc-head')),
+						cfg.hc_mult!,
+						cfg.d_model
+					)
+				}
+			: undefined
 	};
 }

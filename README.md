@@ -33,7 +33,8 @@
 - **Attention 实现**：选到 MLA 时多一个「矩阵吸收合并」执行方式，输出与朴素版逐元素相同
 - **检视层**：4 层任选，层号下方标着这一层的注意力类型（`dense` / `MoE`，或 V4 的 `SWA` / `C4` / `C128`）
 - **FFN / MoE**：按模型结构——R1 前 2 层 dense FFN、其余 MoE；V4 全 MoE
-- **展示阶段开关**：Embedding / Attention / FFN-MoE / Residual / LM Head 五段可开关，关掉的**整段从流程里去掉**（Residual 只在 R1 显示：`x + 子层输出` 每层两次加回，V4 的 Hyper-Connections 还没做）
+- **展示阶段开关**：Embedding / Attention / FFN-MoE / Residual / LM Head 五段可开关，关掉的**整段从流程里去掉**。
+  Residual 分两种：R1 普通残差（`x + 子层输出` 每层两次）；V4 的 mHC（4 条并行残差流 + 每子层 pre/post + 末尾 hc_head，见 doc/10）
 - **流程总览**：整条链的张量方框图，点方框跳到该步；当前步的输入从哪来用带箭头的线画出
 - **每步的数据流图**：分层 DAG，高亮本步正在算的节点
 - **KV Cache 视图**：缓存里到底躺着什么，并与 MHA 的缓存体积对比

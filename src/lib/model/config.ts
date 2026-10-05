@@ -163,6 +163,14 @@ export const V4_FLASH_CFG: ModelConfigLike & { seed: number } = {
 	num_shared_experts: 1,
 	top_k: 2,
 
+	// ── mHC 混合残差流（真实 4 条，展示缩成 2 条）──────
+	// 真实 `hc_mult = 4`（结构），但 4 条流并排太挤、页面复杂——展示只画 2 条，
+	// 每个 mHC 页面都标注"真实 4 条流，此处只演示 2 条"。门控形状随 hc 缩放
+	// （`mix = (2+hc)·hc = 8`，`fn: [8, 2×d_model]`，真实 `[24, 4×4096]`）。
+	hc_mult: 2,
+	hc_sinkhorn_iters: 20,
+	hc_eps: 1e-6,
+
 	seed: 42
 };
 
@@ -186,7 +194,11 @@ export const REAL_V4_FLASH = {
 	num_routed_experts: 256,
 	num_shared_experts: 1,
 	top_k: 6,
-	vocab_size: 129280
+	vocab_size: 129280,
+	// mHC：4 条并行残差流、Sinkhorn 迭代 20 次、eps 1e-6（config.json 与 sglang 默认一致）
+	hc_mult: 4,
+	hc_sinkhorn_iters: 20,
+	hc_eps: 1e-6
 } as const;
 
 /** 真实维度（界面上标注"真实 size 是多少、缩小了几倍"用） */
@@ -213,10 +225,11 @@ export interface ModelSpec {
 	/** 层选择器上每层的标注（如 `dense` / `MoE` / `SWA` / `C4` / `C128`） */
 	layerLabels: string[];
 	/**
-	 * 层故事里是否包含"残差加回"阶段（`x + 子层输出`，每层两步）。
-	 * R1 是普通残差；V4 的残差是 Hyper-Connections（还没做），先不开。
+	 * 层故事里的残差形态：
+	 * `none` = 没有残差阶段；`plain` = 普通残差（x + 子层输出，每层两次）；`mhc` = V4 的 mHC
+	 * （`hc_mult` 条并行残差流 + 每子层 pre/post 混合 + 末尾 `hc_head` 压回）。
 	 */
-	residual: boolean;
+	residual: 'none' | 'plain' | 'mhc';
 }
 
 /** R1：前 2 层 dense FFN、其余 MoE；注意力可选 MHA / MLA */
@@ -230,7 +243,7 @@ export const R1_MODEL: ModelSpec = {
 	attnByLayer: [null, null, null, null],
 	attnChoices: ['mha', 'mla'],
 	layerLabels: ['dense', 'dense', 'MoE', 'MoE'],
-	residual: true
+	residual: 'plain'
 };
 
 /** V4-Flash：全 MoE；注意力逐层固定（纯 SWA / CSA / HCA） */
@@ -244,8 +257,8 @@ export const V4_FLASH_MODEL: ModelSpec = {
 	attnByLayer: ['swa', 'swa', 'csa', 'hca'],
 	attnChoices: [],
 	layerLabels: ['SWA', 'SWA', 'C4', 'C128'],
-	// V4 的残差是 Hyper-Connections（4 条并行残差流），还没做——先不开普通残差阶段
-	residual: false
+	// V4 的残差是 mHC（4 条并行流）
+	residual: 'mhc'
 };
 
 export const MODELS: ModelSpec[] = [R1_MODEL, V4_FLASH_MODEL];

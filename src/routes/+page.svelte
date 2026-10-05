@@ -23,12 +23,12 @@
 	/**
 	 * 可开关的阶段（由流程声明，见 FlowSpec.stageToggles）。
 	 *
-	 * **Residual 只在 R1 显示**：V4 的残差是 Hyper-Connections（还没做），
-	 * 现在给 V4 一个点了没反应的开关只会误导。
+	 * **Residual 只在有残差阶段的模型（R1 普通残差 / V4 mHC）显示**，
+	 * 没有残差的模型给一个点了没反应的开关只会误导。
 	 */
 	const togglesFor = (m: ModelSpec) =>
 		(getFlow('llm').stageToggles ?? LLM_STAGE_TOGGLES).filter(
-			(t) => t.id !== 'residual' || m.residual
+			(t) => t.id !== 'residual' || m.residual !== 'none'
 		);
 	const stageToggles = $derived(togglesFor(model));
 

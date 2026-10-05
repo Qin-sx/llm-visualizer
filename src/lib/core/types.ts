@@ -534,6 +534,12 @@ export interface SumView extends TensorViewBase {
 	terms: MatRef[];
 	/** 逐项逐行的系数：`weights[j][t]` 是第 j 项在第 t 行的权重；缺省视为全 1（纯相加） */
 	weights?: number[][];
+	/**
+	 * 每项右侧**竖挂一列**（与 `terms` 一一对应）——如 mHC 的 pre 门控列：
+	 * `r_k | pre[:,k]`（读门矩阵放它作用的流旁边，逐行揭示和该项同步）。
+	 * 列宽通常 `[S, 1]`；不参与求和，只是把"这一项乘的系数"画出来。
+	 */
+	termSide?: MatRef[];
 	/** 第一段的结果（如 `routed`） */
 	result: MatRef;
 	/**
@@ -798,6 +804,14 @@ export interface ModelConfigLike {
 	/** 输出投影的分组低秩（真实 `o_groups=8` / `o_lora_rank=1024`） */
 	o_groups?: number;
 	o_lora_rank?: number;
+
+	// 混合残差流（DeepSeek V4 的 mHC）需要的字段，可选
+	/** 并行残差流条数（真实 4）；不填 = 普通残差（R1） */
+	hc_mult?: number;
+	/** Sinkhorn 归一化迭代次数（真实 20） */
+	hc_sinkhorn_iters?: number;
+	/** 门控下限 / Sinkhorn 除法的 eps（真实 1e-6） */
+	hc_eps?: number;
 }
 
 export interface LayerCtx {

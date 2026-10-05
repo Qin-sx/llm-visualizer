@@ -260,7 +260,7 @@ export function matRefsOf(t: TensorView): MatRef[] {
 		case 'concat':
 			return [...t.parts, t.result, ...(t.then ? [t.then.b, t.then.result] : [])];
 		case 'sum':
-			return [...t.terms, t.result, ...(t.then ? [...t.then.terms, t.then.result] : [])];
+			return [...t.terms, ...(t.termSide ?? []), t.result, ...(t.then ? [...t.then.terms, t.then.result] : [])];
 		case 'lookup':
 			return [t.table, t.result];
 		default:

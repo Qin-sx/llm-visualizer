@@ -194,11 +194,19 @@ function assertNoDuplicateMatrices(steps: Step[], label: string) {
 	const offenders: string[] = [];
 	for (const s of steps) {
 		const count = new Map<string, number>();
+		/** 每个名字第一次出现时的（数据对象, 是否并行视图）——用于放行"并行分支共用输入" */
+		const first = new Map<string, { data: unknown; parallel: boolean }>();
 		for (const t of s.tensors) {
 			for (const ref of matRefsOf(t)) {
 				// `hideInput: true` 的变换：输入由同一步里别的视图画（如矩阵乘的 C），
 				// 这里不重画，所以不参与"同一个矩阵画两次"的计数
 				if (t.kind === 'transform' && t.hideInput && ref === t.input) continue;
+				const f = first.get(ref.name);
+				// **并行分支共用同一份输入**不算重复画：如写回页两条流都读同一份 y / r_0 / r_1，
+				// 两边数据相同、又都是 `parallel`——这是有意的并排展示。串行链里同名同数据仍要抓
+				// （MLA 的 c_Q / c_KV~ 被画两遍那种）。名字相同但数据不同更是照抓。
+				if (f && f.parallel && t.parallel && f.data === ref.data) continue;
+				if (!f) first.set(ref.name, { data: ref.data, parallel: !!t.parallel });
 				count.set(ref.name, (count.get(ref.name) ?? 0) + 1);
 			}
 		}
@@ -2159,7 +2167,7 @@ console.log('\n[DeepSeek V4 混合注意力：SWA / CSA / HCA]');
 
 	// ── 逆 RoPE 挂在链尾（`tail`），`O_h′` 就在 `O_h` 右边 ──────────
 	{
-		const attnStep = swaDemo.steps.find((s) => s.id.endsWith('-attn'))!;
+		const attnStep = swaDemo.steps.find((s) => s.id === 'swa-attn')!;
 		const chain = attnStep.tensors.find((t) => t.kind === 'transform')!;
 		assert(
 			chain.kind === 'transform' && !!chain.then?.b && !!chain.tail,
@@ -2809,7 +2817,7 @@ console.log('\n[DeepSeek V4 混合注意力：SWA / CSA / HCA]');
 			'HCA 掩码也是三段，但压缩段的注解是"写出的全保留（不检索）"'
 		);
 		const swaChain = swaDemo.steps
-			.find((s) => s.id.endsWith('-attn'))!
+			.find((s) => s.id === 'swa-attn')!
 			.tensors.find((t) => t.kind === 'transform')!;
 		assert(
 			swaChain.kind === 'transform' && swaChain.preMaskParts?.length === 2,
@@ -2914,6 +2922,107 @@ console.log('\n[DeepSeek V4 混合注意力：SWA / CSA / HCA]');
 		csaDemo.steps.find((s) => s.diagram)!.diagram!.nodes !==
 			swaDemo.steps.find((s) => s.diagram)!.diagram!.nodes,
 		'三种层型各用**自己的图对象**（不是把同一张改了）'
+	);
+}
+
+console.log('\n[DeepSeek V4 mHC 残差]');
+{
+	// 4 条并行残差流，每个子层前 pre 混合、算完 post 写回。
+	// 对照 sglang `hc_pre` / `hc_post` / `hc_head_torch` 逐行实现，这里验证数学正确性。
+	const v4 = buildLlmFlow({ modelId: 'v4-flash', attnId: '', ffnId: 'auto', layer: 0 });
+	const cfg = V4_FLASH_MODEL.cfg;
+	const hc = cfg.hc_mult!;
+	const eps = cfg.hc_eps!;
+	const iters = cfg.hc_sinkhorn_iters!;
+	const S = cfg.seq_len;
+	const D = cfg.d_model;
+	assert(hc === 2, `展示 hc_mult = ${hc}（真实 ${REAL_V4_FLASH.hc_mult}，演示只画 2 条流，页面有标注）`);
+	const lt0 = v4.trace.layers[0];
+	assert(!!lt0.mhc, 'V4 每一层都带 mHC 中间量');
+
+	const { streamsIn, attnMix, attnWrite, streamsAfterAttn, ffnMix, ffnWrite } = lt0.mhc!;
+	// 第 0 层：流初始是**同一份** embedding（数量 = 展示的 hc）
+	assert(
+		streamsIn.length === hc && streamsIn.every((s, k) => k === 0 || JSON.stringify(s) === JSON.stringify(streamsIn[0])),
+		`第 0 层 ${hc} 条流是同一份 embedding（真实 ` +
+			`deepseek_v4.py:4685 unsqueeze(1).repeat(1, hc_mult, 1)）`
+	);
+
+	// 门控范围：pre ∈ (ε, 1+ε)、post ∈ (0, 2)
+	for (const [tag, mix] of [
+		['attn', attnMix],
+		['ffn', ffnMix]
+	] as const) {
+		assert(
+			mix.pre.flat().every((v) => v > eps && v < 1 + eps),
+			`${tag} pre ∈ (ε, 1+ε)：${mix.pre[0][0].toFixed(4)} …（sigmoid + ε，不归一化）`
+		);
+		assert(
+			mix.post.flat().every((v) => v > 0 && v < 2),
+			`${tag} post ∈ (0, 2)：${mix.post[0][0].toFixed(4)} …（2·sigmoid，写回能增强）`
+		);
+		// comb 每 token 一个 hc×hc，Sinkhorn 后行和 ≈ 列和 ≈ 1（双随机）
+		const rowErr = mix.comb.map((row) => {
+			const rs: number[] = [];
+			for (let j = 0; j < hc; j++) rs.push(row.slice(j * hc, j * hc + hc).reduce((a, b) => a + b, 0));
+			return Math.max(...rs.map((r) => Math.abs(r - 1)));
+		});
+		const colErr = mix.comb.map((row) => {
+			const cs: number[] = [];
+			for (let k = 0; k < hc; k++) {
+				let s = 0;
+				for (let j = 0; j < hc; j++) s += row[j * hc + k];
+				cs.push(s);
+			}
+			return Math.max(...cs.map((c) => Math.abs(c - 1)));
+		});
+		assert(
+			Math.max(...rowErr, ...colErr) < 0.05,
+			`${tag} comb 是双随机矩阵（行和/列和 ≈ 1，最大偏差 ${Math.max(...rowErr, ...colErr).toExponential(1)}，` +
+				`Sinkhorn ${iters} 次）`
+		);
+	}
+
+	// 混合 = Σ pre_k·r_k（逐元素）
+	const comb = attnMix.combined;
+	const mixedOk = comb.every((row, i) =>
+		row.every(
+			(v, d) =>
+				Math.abs(v - streamsIn.reduce((a, s, k) => a + attnMix.pre[i][k] * s[i][d], 0)) < 1e-9
+		)
+	);
+	assert(mixedOk, 'combined = Σ_k pre_k·r_k（逐元素一致）');
+
+	// 写回 = post_k·y + Σ_j comb_kj·r_j
+	const writeOk = attnWrite.newStreams.every((ns, k) =>
+		ns.every((row, i) =>
+			row.every((v, d) => {
+				const want = attnWrite.postY[k][i][d] + attnWrite.combOld[k][i][d];
+				return Math.abs(v - want) < 1e-9;
+			})
+		)
+	);
+	assert(writeOk, 'newStreams[k] = postY[k] + combOld[k]（逐元素一致）');
+
+	// 流在子层之间确实"写回 + 再读"：FFN 的输入流 = 注意力写回后的流
+	const sameStreams =
+		streamsAfterAttn.every((s, k) => JSON.stringify(s) === JSON.stringify(attnWrite.newStreams[k])) &&
+		lt0.mhc!.streamsAfterFfn.every((s, k) => JSON.stringify(s) === JSON.stringify(ffnWrite.newStreams[k]));
+	assert(sameStreams, 'streamsAfterAttn / streamsAfterFfn 就是对应写回产出（引用一致）');
+
+	// hc_head：压回 [S, D]，logits 有限
+	assert(v4.trace.hcHead!.out.length === S && v4.trace.hcHead!.out[0].length === D, 'hc_head 压回 [S, d_model]');
+	assert(v4.trace.logits.every((row) => row.every(Number.isFinite)), 'V4 的 logits 全部有限（hc_head 后进 LM Head）');
+
+	// 残差阶段在 V4 有 7 段（gates-attn/pre-attn/post-attn/gates-ffn/pre-ffn/post-ffn/head），关掉整段一起消失
+	const v4ResSegs = v4.segments.filter((s) => s.stage === 'residual');
+	assert(v4ResSegs.length === 7, `V4 的 Residual 阶段有 7 段（实际 ${v4ResSegs.length}）`);
+	const off7 = buildLlmFlow({ modelId: 'v4-flash', attnId: '', ffnId: 'auto', layer: 0, off: ['residual'] });
+	assert(
+		off7.steps.length === v4.steps.length - 7 &&
+			!off7.stages.some((s) => s.id === 'residual') &&
+			off7.segments.every((s) => s.stage !== 'residual'),
+		`关掉 Residual：7 步一起消失（${v4.steps.length} → ${off7.steps.length}）、节点和区间也没有它`
 	);
 }
 

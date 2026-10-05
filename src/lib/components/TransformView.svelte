@@ -246,6 +246,7 @@ import { transformCellSize, transformPhaseMs } from '$lib/core/steps';
 				{cellSize}
 				highlightRow={mmWork > 0 && mmP > 0 ? mmI : currentRow}
 				scanRows={scanRows}
+				bands={view.output.bands}
 				highlightCols={view.tail && !view.then && tailP > 0
 					? view.tail.highlightCols
 					: view.highlightCols}
