@@ -17,7 +17,7 @@ import {
 	zeros,
 	type Mat
 } from '$lib/core/mat';
-import type { SemanticsSpec } from '$lib/core/types';
+import type { SemanticsSpec, Step } from '$lib/core/types';
 import { REAL_R1 } from '$lib/model/config';
 
 interface FfnWeights {
@@ -25,8 +25,14 @@ interface FfnWeights {
 	Wdown: Mat;
 }
 
-interface MoeWeights {
-	Wrouter: Mat;
+export interface MoeWeights {
+	/** 学出来的路由权重（非 hash 层用；hash 层没有它） */
+	Wrouter?: Mat;
+	/**
+	 * hash 路由表（hash 层用）：`[vocab_size × top_k]`，每个 token id 固定选哪些专家。
+	 * 真实模型里这份表在 checkpoint 里（离线按 hash 预计算，`tid2eid`），运行时只查表。
+	 */
+	tid2eid?: number[][];
 	experts: FfnWeights[];
 	shared: FfnWeights;
 }
@@ -34,9 +40,9 @@ interface MoeWeights {
 export interface MoeTrace {
 	out: Mat;
 	x: Mat;
-	/** [seq, num_routed_experts] */
-	routerLogits: Mat;
-	routerProbs: Mat;
+	/** [seq, num_routed_experts]（hash 层没有——不学路由就没有分数） */
+	routerLogits?: Mat;
+	routerProbs?: Mat;
 	/** [seq][top_k] */
 	topkIdx: number[][];
 	topkW: number[][];
@@ -46,6 +52,29 @@ export interface MoeTrace {
 	sharedOut: Mat;
 	/** 每个专家分到多少个 token（负载分布） */
 	expertLoad: number[];
+}
+
+/** 这一层是不是 hash 路由（前 `n_hash_layers` 层；不填 = 全学） */
+function isHash(ctx: { layer: number; cfg: { n_hash_layers?: number } }): boolean {
+	return (ctx.cfg.n_hash_layers ?? 0) > ctx.layer;
+}
+
+/** 哈希表：每个 token id 固定抽 top_k 个**互不相同**的专家（与内容无关） */
+function makeHashTable(
+	rnd: () => number,
+	cfg: { vocab_size: number; num_routed_experts: number; top_k: number }
+): number[][] {
+	const { vocab_size: V, num_routed_experts: E, top_k: K } = cfg;
+	const table: number[][] = [];
+	for (let t = 0; t < V; t++) {
+		const row: number[] = [];
+		while (row.length < K) {
+			const e = Math.floor(rnd() * E);
+			if (!row.includes(e)) row.push(e);
+		}
+		table.push(row);
+	}
+	return table;
 }
 
 export const deepseekMoe: SemanticsSpec<MoeTrace> = {
@@ -58,7 +87,19 @@ export const deepseekMoe: SemanticsSpec<MoeTrace> = {
 	defaultDepth: 'L2',
 	maxDepth: 'L2',
 
-	makeWeights(rnd, cfg) {
+	makeWeights(rnd, cfg, layer) {
+		// hash 层：没有 W_router，只有一张"token id → 专家"的查表
+		if ((cfg.n_hash_layers ?? 0) > layer) {
+			return {
+				tid2eid: makeHashTable(rnd, cfg),
+				experts: Array.from({ length: cfg.num_routed_experts }, () =>
+					randFfnPair(rnd, cfg.d_model, cfg.moe_intermediate)
+				),
+				shared: randFfnPair(rnd, cfg.d_model, cfg.moe_intermediate)
+			};
+		}
+		// 学出来的路由：**保持原有抽取顺序**（Wrouter → experts → shared）——
+		// 换顺序会让这条流后面所有权重移位，页面上已有数字全变
 		return {
 			// 路由权重按行归一化，避免"范数最大的专家通吃"（见 mat.ts 的 normalizeRows）
 			Wrouter: normalizeRows(randMat(cfg.d_model, cfg.num_routed_experts, rnd)),
@@ -72,13 +113,34 @@ export const deepseekMoe: SemanticsSpec<MoeTrace> = {
 	compute(x, ctx) {
 		const { num_routed_experts: E, top_k: K, d_model: D } = ctx.cfg;
 		const w = ctx.w as MoeWeights;
+		const hash = isHash(ctx);
 
-		const routerLogits = matmul(x, w.Wrouter);
-		const routerProbs = softmaxRows(routerLogits);
+		// hash 层：不学路由——直接查表选专家，权重均分（与输入内容无关，改 x 不改变去向）
+		let routerLogits: Mat | undefined;
+		let routerProbs: Mat | undefined;
+		let topkIdx: number[][] = [];
+		let topkW: number[][] = [];
+		if (hash) {
+			const tid = ctx.tokenIds ?? [];
+			topkIdx = tid.map((id) => w.tid2eid![id].slice());
+			topkW = topkIdx.map(() => Array.from({ length: K }, () => 1 / K));
+		} else {
+			const rLogits = matmul(x, w.Wrouter!);
+			const rProbs = softmaxRows(rLogits);
+			routerLogits = rLogits;
+			routerProbs = rProbs;
+			const S = x.length;
+			for (let t = 0; t < S; t++) {
+				const idx = topK(rProbs[t], K);
+				const raw = idx.map((i) => rProbs[t][i]);
+				const sum = raw.reduce((a, b) => a + b, 0) || 1;
+				const wts = raw.map((v) => v / sum); // top-k 权重归一化
+				topkIdx.push(idx);
+				topkW.push(wts);
+			}
+		}
 
 		const S = x.length;
-		const topkIdx: number[][] = [];
-		const topkW: number[][] = [];
 		const expertOut: number[][][] = [];
 		const expertLoad = new Array<number>(E).fill(0);
 		const routedOut = zeros(S, D);
@@ -90,14 +152,8 @@ export const deepseekMoe: SemanticsSpec<MoeTrace> = {
 		};
 
 		for (let t = 0; t < S; t++) {
-			const idx = topK(routerProbs[t], K);
-			const raw = idx.map((i) => routerProbs[t][i]);
-			const sum = raw.reduce((a, b) => a + b, 0) || 1;
-			const wts = raw.map((v) => v / sum); // top-k 权重归一化
-
-			topkIdx.push(idx);
-			topkW.push(wts);
-
+			const idx = topkIdx[t];
+			const wts = topkW[t];
 			const outs: number[][] = [];
 			for (let j = 0; j < K; j++) {
 				const e = idx[j];
@@ -165,15 +221,72 @@ export const deepseekMoe: SemanticsSpec<MoeTrace> = {
 		});
 		const loadLabel = trace.expertLoad.map((n, e) => `E${e}: ${n} token`);
 
-		// top-k 选择的结果：每行只保留概率最高的 K 个（归一化后的门控权重），其余归零
-		const g = trace.routerProbs.map((row, t) =>
-			row.map((_, e) => {
-				const j = trace.topkIdx[t].indexOf(e);
-				return j >= 0 ? trace.topkW[t][j] : 0;
-			})
-		);
+		// 选中的 K 个专家（及其权重）摊回"每个专家一列"：选中的填门控权重，其余 0。
+		// 学出来的路由：softmax top-k 权重；hash 路由：均分 1/K——两种都从这里取。
+		const g = trace.topkIdx.map((idx, t) => {
+			const row = new Array<number>(E).fill(0);
+			idx.forEach((e, j) => {
+				row[e] = trace.topkW[t][j];
+			});
+			return row;
+		});
 
-		return [
+		// hash 层：第一步换成"哈希查表选专家"（不学路由就没有打分 / softmax 那两步）。
+		// 注意必须是**惰性函数**：对象字面量里的 `rows.map(...)` 在构造时就求值，
+		// 非 hash 层没有 `tid2eid`，构造就崩。
+		const hash = isHash(ctx);
+		const hashStep = (): Step => ({
+			id: 'moe-hash-lookup',
+			kind: 'SELECT',
+			label:
+				`前 ${ctx.cfg.n_hash_layers} 层**不学路由**：每个 token 直接按 token id 查哈希表选专家——` +
+				`同一 token 永远去同一批专家，和内容无关（改 x 不改变去向）。` +
+				`查表后权重**均分** 1/${K}（不学路由，权重也没得学）`,
+			formula: '\\mathrm{TopK}_t=\\mathrm{HashTable}[\\mathrm{token\\_id}_t]',
+			tensors: [
+				{
+					name: 'hash-lookup',
+					kind: 'lookup',
+					shape: [S, K],
+					table: {
+						name: '哈希表',
+						shape: [ctx.cfg.vocab_size, K],
+						data: w.tid2eid,
+						realShape: [R.vocab_size, R.top_k],
+						label: `← 离线按 hash 预计算：每个 token id 固定对应 ${K} 个专家（真实表在 checkpoint 的 tid2eid）`
+					},
+					keys: ctx.tokenIds ?? [],
+					rows: (ctx.tokenIds ?? []).map((id) => w.tid2eid![id]),
+					result: {
+						name: '选中的专家',
+						shape: [S, K],
+						data: (ctx.tokenIds ?? []).map((id) => w.tid2eid![id]),
+						realShape: [S, R.top_k],
+						label: '← 查表取出的专家 id（token id 固定 → 专家固定）'
+					},
+					keyName: 'token id'
+				},
+				{
+					name: 'hash-load',
+					label: `各专家分到的 token 数（共 ${E} 个专家，真实 ${R.num_routed_experts} 个）`,
+					kind: 'bars',
+					shape: [E],
+					data: trace.expertLoad,
+					labels: loadLabel
+				},
+				{
+					name: 'hash-note',
+					kind: 'shape',
+					wide: true,
+					shape: [ctx.cfg.vocab_size, K],
+					note:
+						`不学路由 = 没有 W_router、没有 softmax、没有 top-k 打分——专家选择完全由 token id 决定。` +
+						`下游（专家计算 / 共享专家）和学出来的路由**完全同一套**。`
+				}
+			]
+		});
+
+		const headSteps: Step[] = hash ? [hashStep()] : [
 			// ── 1. 路由打分 ───────────────────────────────
 			{
 				id: 'moe-route',
@@ -257,8 +370,11 @@ export const deepseekMoe: SemanticsSpec<MoeTrace> = {
 					}
 				]
 			},
+		];
 
-			// ── 4. 专家升维：每个专家把分给它的**整批 token** 一起算 ──
+		return [
+			...headSteps,
+			// ── 3. 专家升维：每个专家把分给它的**整批 token** 一起算 ──
 			{
 				id: 'moe-experts',
 				kind: 'MATMUL',

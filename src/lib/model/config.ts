@@ -171,6 +171,11 @@ export const V4_FLASH_CFG: ModelConfigLike & { seed: number } = {
 	hc_sinkhorn_iters: 20,
 	hc_eps: 1e-6,
 
+	// ── hash 路由（V4 前几层不学路由）──────
+	// 真实 `num_hash_layers = 3`（前 3 层 hash），demo 用前 2 层（doc/09 §1.1 定的）：
+	// 前 2 层（SWA 那两层）的 MoE 不学路由，直接按 token id 查哈希表选专家。
+	n_hash_layers: 2,
+
 	seed: 42
 };
 
@@ -198,7 +203,9 @@ export const REAL_V4_FLASH = {
 	// mHC：4 条并行残差流、Sinkhorn 迭代 20 次、eps 1e-6（config.json 与 sglang 默认一致）
 	hc_mult: 4,
 	hc_sinkhorn_iters: 20,
-	hc_eps: 1e-6
+	hc_eps: 1e-6,
+	// hash 路由：真实前 3 层不学路由（`num_hash_layers: 3`）
+	n_hash_layers: 3
 } as const;
 
 /** 真实维度（界面上标注"真实 size 是多少、缩小了几倍"用） */

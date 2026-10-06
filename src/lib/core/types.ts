@@ -812,6 +812,10 @@ export interface ModelConfigLike {
 	hc_sinkhorn_iters?: number;
 	/** 门控下限 / Sinkhorn 除法的 eps（真实 1e-6） */
 	hc_eps?: number;
+
+	// hash 路由（DeepSeek V4 前几层不学路由）需要的字段，可选
+	/** 前这么多个层用 hash 路由（真实 V4-Flash = 3）；不填 = 全学（R1） */
+	n_hash_layers?: number;
 }
 
 export interface LayerCtx {
@@ -819,6 +823,8 @@ export interface LayerCtx {
 	cfg: ModelConfigLike;
 	/** 该插槽在本层的权重包，由 model 层提供；插件自行断言其类型 */
 	w: unknown;
+	/** 本层输入的 token id 序列（hash 路由查表用；其他插件可忽略） */
+	tokenIds?: number[];
 }
 
 // ── 插件协议 ──────────────────────────────────────────────

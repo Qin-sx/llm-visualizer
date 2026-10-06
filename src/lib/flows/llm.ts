@@ -687,7 +687,8 @@ export function buildLlmFlow(opts: LlmFlowOptions): LlmFlowResult {
 	const ctxFor = (key: string): LayerCtx => ({
 		layer,
 		cfg,
-		w: weights.slots[key]?.[layer]
+		w: weights.slots[key]?.[layer],
+		tokenIds: trace.tokenIds
 	});
 
 	// 关掉的阶段**根本不进流程**：步骤、流程图节点、总览都跟着消失

@@ -9,7 +9,7 @@
 import '../src/lib/slots';
 import '../src/lib/flows';
 import { buildLlmFlow, type LlmFlowResult } from '../src/lib/flows/llm';
-import { listFlows, getFlow, listImplementationsFor, resolvePlugin } from '../src/lib/core/registry';
+import { listFlows, getFlow, getSemantics, listImplementationsFor, resolvePlugin } from '../src/lib/core/registry';
 import { matRefsOf } from '../src/lib/core/overview';
 import { CONFIG, REAL_R1, REAL_V4_FLASH, R1_MODEL, V4_FLASH_MODEL, attnIdFor, pluginsOf } from '../src/lib/model/config';
 import { buildOverviewItems, itemKeys, refKey } from '../src/lib/core/overview';
@@ -42,7 +42,7 @@ import type { MlaTrace } from '../src/lib/slots/attention/mla';
 import type { MlaAbsorbTrace } from '../src/lib/slots/attention/absorb';
 import type { HybridTrace } from '../src/lib/slots/attention/hybrid';
 import type { Step, MatRef } from '../src/lib/core/types';
-import type { MoeTrace } from '../src/lib/slots/ffn-moe/deepseek-moe';
+import type { MoeTrace, MoeWeights } from '../src/lib/slots/ffn-moe/deepseek-moe';
 
 function assert(cond: unknown, msg: string) {
 	if (!cond) throw new Error('✗ ' + msg);
@@ -3023,6 +3023,57 @@ console.log('\n[DeepSeek V4 mHC 残差]');
 			!off7.stages.some((s) => s.id === 'residual') &&
 			off7.segments.every((s) => s.stage !== 'residual'),
 		`关掉 Residual：7 步一起消失（${v4.steps.length} → ${off7.steps.length}）、节点和区间也没有它`
+	);
+}
+
+console.log('\n[DeepSeek V4 hash 路由]');
+{
+	const cfg = V4_FLASH_MODEL.cfg;
+	const HASH_N = cfg.n_hash_layers ?? 0;
+	assert(
+		HASH_N === 2,
+		`演示前 ${HASH_N} 层 hash 路由（真实 ${REAL_V4_FLASH.n_hash_layers} 层）`
+	);
+	const h = buildLlmFlow({ modelId: 'v4-flash', attnId: '', ffnId: 'auto', layer: 0 });
+	const l = buildLlmFlow({ modelId: 'v4-flash', attnId: '', ffnId: 'auto', layer: 2 });
+	const hTrace = h.trace.layers[0].ffn as MoeTrace;
+	const lTrace = l.trace.layers[2].ffn as MoeTrace;
+
+	// hash 层：没有 W_router 打分，直接查表选专家，权重均分
+	assert(hTrace.routerLogits === undefined, 'hash 层没有路由分数（不学路由）');
+	assert(
+		hTrace.topkW.every((row) => row.every((v) => v === 1 / cfg.top_k)),
+		`hash 层权重均分 1/${cfg.top_k}（不学路由，权重也没得学）`
+	);
+
+	// 查表一致性：每个 token 选中的专家 = 哈希表[token id] 那一行
+	const hashW = (initWeights(V4_FLASH_MODEL).slots['deepseek-moe'] as unknown[])[0] as MoeWeights;
+	const table = hashW.tid2eid!;
+	assert(
+		hTrace.topkIdx.every(
+			(idx, t) => JSON.stringify(idx) === JSON.stringify(table[h.trace.tokenIds[t]])
+		),
+		`每个 token 选中的专家 = 哈希表[token id] 那一行（token id 固定 → 专家固定）`
+	);
+
+	// 与输入内容无关：换一个完全不同的 x，选择不变（选择只跟 token id 走）
+	const sem = getSemantics('deepseek-moe');
+	const ctx0 = { layer: 0, cfg, w: hashW, tokenIds: h.trace.tokenIds };
+	const xA = Array.from({ length: cfg.seq_len }, (_, i) =>
+		Array.from({ length: cfg.d_model }, (_, j) => i + j)
+	);
+	const xB = xA.map((row) => row.map((v) => -v * 3));
+	const ta = sem.compute(xA, ctx0) as MoeTrace;
+	const tb = sem.compute(xB, ctx0) as MoeTrace;
+	assert(
+		JSON.stringify(ta.topkIdx) === JSON.stringify(tb.topkIdx),
+		'改 x 不改变专家选择（hash 只依赖 token id，与内容无关）'
+	);
+
+	// 非 hash 层（第 HASH_N 层起）：仍走学出来的路由（有打分、topk 从 softmax 来）
+	assert(
+		!!lTrace.routerLogits && !!lTrace.routerProbs,
+		`第 ${HASH_N} 层之后仍是学出来的路由（有 W_router 打分）`
 	);
 }
 

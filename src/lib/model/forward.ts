@@ -106,7 +106,7 @@ export function forward(
 			const streamsIn = streams;
 			// Attention：pre 混合 → RMSNorm → 注意力 → post 写回
 			const attnMix = hcMix(streams, hcW.attn.fn, hcW.attn.base, hcW.attn.scale, hc, cfg.hc_sinkhorn_iters!, cfg.hc_eps!);
-			const attnCtx: LayerCtx = { layer: l, cfg, w: weights.slots[attn.weightKey]?.[l] };
+			const attnCtx: LayerCtx = { layer: l, cfg, w: weights.slots[attn.weightKey]?.[l], tokenIds };
 			const attnTrace = attn.compute(attnMix.normed, attnCtx);
 			const attnWrite = hcWrite(attnTrace.out, streams, attnMix.post, attnMix.comb, hc);
 			// 写回产出**新**的流数组（不再复用旧引用），下一阶段引用它即可
@@ -116,7 +116,7 @@ export function forward(
 			const ffnId = resolveFfn(l);
 			const ffnSpec = getSemantics(ffnId);
 			const ffnMix = hcMix(streams, hcW.ffn.fn, hcW.ffn.base, hcW.ffn.scale, hc, cfg.hc_sinkhorn_iters!, cfg.hc_eps!);
-			const ffnCtx: LayerCtx = { layer: l, cfg, w: weights.slots[ffnId]?.[l] };
+			const ffnCtx: LayerCtx = { layer: l, cfg, w: weights.slots[ffnId]?.[l], tokenIds };
 			const ffnTrace = ffnSpec.compute(ffnMix.normed, ffnCtx);
 			const ffnWrite = hcWrite(ffnTrace.out, streams, ffnMix.post, ffnMix.comb, hc);
 			streams = ffnWrite.newStreams;
