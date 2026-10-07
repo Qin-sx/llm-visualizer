@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { base } from '$app/paths';
 	// 纯静态页：列出随产物分发的第三方软件及其许可。
 	// 存在的原因：构建会压缩 JS，把依赖里自带的版权声明（尤其是 GSAP 的）
 	// 一并去掉，而 GSAP 的许可条款明确要求「不得移除 proprietary notices」。
@@ -83,7 +84,7 @@
 		</p>
 	</section>
 
-	<p class="back"><a href="/">← 返回 LLM Visualizer</a></p>
+	<p class="back"><a href={base + '/'}>← 返回 LLM Visualizer</a></p>
 </main>
 
 <style>

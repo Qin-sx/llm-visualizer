@@ -2,6 +2,7 @@
 	import '$lib/slots'; // 副作用：注册全部算子插件
 	import '$lib/flows'; // 副作用：注册全部流程
 	import { untrack } from 'svelte';
+	import { base } from '$app/paths';
 	import { getFlow, getSemantics, listImplementationsFor } from '$lib/core/registry';
 	import { getModel, layerKind, MODELS, type ModelSpec } from '$lib/model/config';
 	import { buildLlmFlow, LLM_STAGE_TOGGLES, type LlmFlowResult } from '$lib/flows/llm';
@@ -279,7 +280,7 @@
 			维度按 {demo.model.name} 的结构等比缩小；权重为固定 seed
 			的随机值——本页讲的是<b>机制</b>，不是知识。
 		</div>
-		<p class="lic"><a href="/licenses/">第三方许可 →</a></p>
+		<p class="lic"><a href={base + '/licenses/'}>第三方许可 →</a></p>
 	</aside>
 
 	{#if steps.length > 0}
