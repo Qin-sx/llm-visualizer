@@ -85,7 +85,10 @@
 		/** 被"折掉"的环节（吸收合并里：q → q̄、折出来的两个权重） */
 		absorbed: { fill: '#ecfeff', stroke: '#67e8f9', text: '#155e75', line: '#0891b2' },
 		/** 这个实现不再需要的矩阵 */
-		gone: { fill: '#f8fafc', stroke: '#cbd5e1', text: '#94a3b8', line: '#cbd5e1', dash: true }
+		gone: { fill: '#f8fafc', stroke: '#cbd5e1', text: '#94a3b8', line: '#cbd5e1', dash: true },
+		// V4.1 CSA2：本层**不算、但读共享池**的矩阵——不是"没有"，而是"来自第 N 层"。
+		// 用浅天蓝（区别于 gone 的灰"不存在"）提醒"这条支路真的在用，只是来源在别处"。
+		shared: { fill: '#f0f9ff', stroke: '#bae6fd', text: '#0284c7', line: '#38bdf8', dash: true }
 	};
 	const tone = (n: DataflowNode) => TONES[n.tone ?? 'input'];
 
@@ -109,7 +112,8 @@
 		{ tone: 'weight', text: '可学习的偏置' },
 		{ tone: 'cache', text: 'KV Cache' },
 		{ tone: 'absorbed', text: '吸收合并改动的环节' },
-		{ tone: 'gone', text: '不参与本层计算的矩阵与路径' }
+		{ tone: 'gone', text: '不参与本层计算的矩阵与路径' },
+		{ tone: 'shared', text: '来自源层的共享矩阵（本层不计算，直接读）' }
 	];
 	/** 只有图上真出现这种配色时才列进图例 */
 	const shownLegend = $derived(

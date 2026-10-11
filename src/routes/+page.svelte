@@ -18,7 +18,7 @@
 	 * **代表模型**：注意力与 FFN 都按层定下来，所以 UI 上不是"自由组合插件"，
 	 * 而是"选一个代表模型 + 选一层"。非法组合（如 MLA 配 V4）因此根本不存在。
 	 */
-	let modelId = $state('v4-flash');
+	let modelId = $state('v4.1-flash');
 	const model = $derived(getModel(modelId));
 	const layerList = $derived(Array.from({ length: model.cfg.num_layers }, (_, i) => i));
 	/**
@@ -151,8 +151,14 @@
 		demo.segments.find((s) => stepIndex >= s.from && stepIndex < s.to)?.stage ?? ''
 	);
 
-	/** 某一层用的注意力插件名（逐层固定时给 UI 显示用） */
-	const attnNameOf = (l: number) => getSemantics(demo.model.attnByLayer[l] ?? attnId).name;
+	/**
+	 * 某一层用的注意力插件名（逐层固定时给 UI 显示用）。
+	 *
+	 * 必须读 `model`（跟着 `modelId` 同步更新）而不是 `demo.model`：换模型时 `demo`
+	 * 还是旧模型的流程（重建它的 `$effect` 在渲染之后才跑），新模型的 layerList 先渲染、
+	 * 旧模型的 attnByLayer 只有 4 项——层号超出时 `?? attnId` 落到空串，`getSemantics('')`
+	 */
+	const attnNameOf = (l: number) => getSemantics(model.attnByLayer[l] ?? attnId).name;
 
 	function handleSpeed(v: number) {
 		speed = v;
@@ -206,6 +212,11 @@
 			<span class="ctl-label">检视层</span>
 			<div class="layer-row">
 				{#each layerList as l (l)}
+					{#if model.layerSegments?.some((s) => s.from === l)}
+						<span class="layer-seg">
+							{model.layerSegments.find((s) => s.from === l)!.label}
+						</span>
+					{/if}
 					<button
 						class="layer-chip"
 						class:active={layer === l}
@@ -245,7 +256,7 @@
 		stages={demo.stages}
 		{activeStage}
 		{layer}
-		layerCount={demo.model.cfg.num_layers}
+		layerCount={model.cfg.num_layers}
 	/>
 
 	<!-- 流程总览放在流水线**下面**：先看清"整条链有哪几个阶段、当前在哪一段"，
@@ -407,6 +418,28 @@
 		outline: 2px solid #4f46e5;
 		outline-offset: 1px;
 		font-weight: 700;
+	}
+	/* 层分段标注（V4.1 的编码器 / 解码器）：细竖线 + 小字，插在 chip 之间 */
+	.layer-seg {
+		display: flex;
+		align-items: center;
+		font-size: 0.6rem;
+		font-weight: 600;
+		color: #f97316;
+		letter-spacing: 0.06em;
+		padding: 0 0.35rem;
+		border-left: 2px solid #fdba74;
+		margin-left: 0.2rem;
+		align-self: stretch;
+	}
+	.layer-seg::before {
+		content: '';
+		flex: 0 0 1px;
+	}
+	.layer-row .layer-seg:first-child {
+		border-left: none;
+		padding-left: 0;
+		margin-left: 0;
 	}
 	/* 阶段开关：开着的用靛蓝实底，关掉的灰掉并加删除线——一眼看出"这段不在流程里" */
 	.stage-chip {

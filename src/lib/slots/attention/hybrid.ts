@@ -262,7 +262,9 @@ export function hybridCompute(
 	const cQ = matmul(x, w.Wqa);
 	const cQNorm = rmsNorm(cQ);
 	const qUp = matmul(cQNorm, w.Wqb);
-	const qHeads = splitHeads(qUp, H, hd).map((h) => rmsNorm(h));
+	// 每头归一化：V4 有（q_head_norm=true），V4.1 没有（=false，Q 只做 RoPE）。
+	// 关掉时 qHeads 就是按头切开的原始输出，`qFlat` 也随之不带归一化。
+	const qHeads = splitHeads(qUp, H, hd).map((h) => (cfg.q_head_norm === false ? h : rmsNorm(h)));
 	const qNope = qHeads.map((h) => h.map((r) => r.slice(0, dn)));
 	const qPeRaw = qHeads.map((h) => h.map((r) => r.slice(dn)));
 	const qPe = qPeRaw.map((h) => h.map((r, i) => ropeApply(r, i, theta)));
@@ -282,7 +284,6 @@ export function hybridCompute(
 
 	// ── 一次注意力：滑窗 token + 压缩条目 + sink ──
 	const nE = compKv ? compKv.length : 0;
-	const cols = S + nE + 1;
 	const sinkCol = S + nE;
 
 	const tokVisible = (i: number, j: number) => j <= i && i - j < W;
@@ -298,6 +299,76 @@ export function hybridCompute(
 		1
 	]);
 
+	// ── 融合注意力 + 逆 RoPE + 分组低秩输出（V4 与 V4.1 共用的公共尾段） ──
+	const tail = fusedTail(q, kv, compKv, w.sink, mask, w, hd, dn, theta, G, perGroup, oLora, H);
+
+	return {
+		out: tail.out,
+		x,
+		cQ,
+		cQNorm,
+		qUp,
+		qFlat: mergeHeads(qHeads, hd),
+		qPeRaw,
+		qPe,
+		q,
+		kvRaw,
+		kvNorm,
+		kv,
+		compress: compTrace,
+		indexer: idxTrace,
+		compKv,
+		kAll,
+		scoreReal: tail.scoreReal,
+		// V 的最后一行是 sink 的 V = 0：它只进分母
+		vAll: tail.vAll,
+		sink: w.sink,
+		cols: tail.cols,
+		nE,
+		sinkCol: tail.sinkCol,
+		scores: tail.scores,
+		mask,
+		maskedScores: tail.maskedScores,
+		probs: tail.probs,
+		headOut: tail.headOut,
+		headOutInv: tail.headOutInv,
+		groups: tail.groups,
+		groupLatent: tail.groupLatent,
+		oLatent: tail.oLatent
+	};
+}
+
+/**
+ * 融合注意力的**公共尾段**：分数（Q·Kᵀ/√d + sink 列）→ 掩码 → softmax → P·V →
+ * 逆 RoPE → 分组低秩输出投影 → `out`。V4（hybridCompute）与 V4.1（csa2Compute）共用——
+ * 两者的区别只在"压缩 / 检索怎么来"（各层自算 vs 读共享池），融合本身完全同构。
+ *
+ * `mask` 由调用方算好传入（V4：滑窗规则 + 自己的 indexer top-k；V4.1：滑窗规则 + 池的 top-k）。
+ */
+export function fusedTail(
+	q: number[][][],
+	kv: Mat,
+	compKv: Mat | null,
+	sink: Vec,
+	mask: Mat,
+	w: HybridWeights,
+	hd: number,
+	dn: number,
+	theta: number,
+	G: number,
+	perGroup: number,
+	oLora: number,
+	H: number
+): Pick<
+	HybridTrace,
+	'cols' | 'sinkCol' | 'scoreReal' | 'vAll' | 'scores' | 'maskedScores' | 'probs' | 'headOut' | 'headOutInv' | 'groups' | 'groupLatent' | 'oLatent'
+> & { out: Mat } {
+	const S = kv.length;
+	const nE = compKv ? compKv.length : 0;
+	const sinkCol = S + nE;
+	const cols = S + nE + 1;
+	const kAll: Mat = Array.from({ length: S + nE }, (_, j) => (j < S ? kv[j] : compKv![j - S]));
+
 	const scale = Math.pow(hd, -0.5);
 	const scores: number[][][] = [];
 	const maskedScores: number[][][] = [];
@@ -310,7 +381,7 @@ export function hybridCompute(
 		const raw = Array.from({ length: S }, (_, i) => [
 			...Array.from({ length: S }, (_, j) => scale * dot(q[h][i], kv[j])),
 			...Array.from({ length: nE }, (_, e) => scale * dot(q[h][i], compKv![e])),
-			w.sink[h]
+			sink[h]
 		]);
 		const masked = raw.map((row, i) => row.map((v, j) => (mask[i][j] ? v : NEG_INF)));
 		const p = masked.map(softmaxRow);
@@ -348,57 +419,48 @@ export function hybridCompute(
 	const oLatent: Mat = Array.from({ length: S }, (_, i) => groupLatent.flatMap((gl) => gl[i]));
 
 	return {
-		out: matmul(oLatent, w.Wob),
-		x,
-		cQ,
-		cQNorm,
-		qUp,
-		qFlat: mergeHeads(qHeads, hd),
-		qPeRaw,
-		qPe,
-		q,
-		kvRaw,
-		kvNorm,
-		kv,
-		compress: compTrace,
-		indexer: idxTrace,
-		compKv,
-		kAll,
+		cols,
+		sinkCol,
 		scoreReal: scores[0].map((row) => row.slice(0, S + nE)),
 		// V 的最后一行是 sink 的 V = 0：它只进分母
 		vAll: [...kAll, new Array<number>(hd).fill(0)],
-		sink: w.sink,
-		cols,
-		nE,
-		sinkCol,
 		scores,
-		mask,
 		maskedScores,
 		probs,
 		headOut,
 		headOutInv,
 		groups,
 		groupLatent,
-		oLatent
+		oLatent,
+		out: matmul(oLatent, w.Wob)
 	};
 }
 
 // ══════════════════════════════════════════════════════════
 // 步骤：前段（Q / KV / RoPE）与后段（注意力 / 输出 / 缓存）
 // ══════════════════════════════════════════════════════════
+/**
+ * head / tail 步骤只需要 trace 的一批字段，且对 `indexer` 只要求 `topk`——
+ * V4 的 `HybridTrace`（IndexerTrace）与 V4.1 的 `Csa2Trace`（Csa2IndexerTrace）都满足。
+ */
+export type HybridTraceForSteps = Omit<HybridTrace, 'indexer'> & { indexer: { topk: number[][]; logits: Mat } | null };
+
 /** 前段：Q 与 KV 两条投影 + 归一化 + RoPE */
 export function hybridHeadSteps(
-	trace: HybridTrace,
+	trace: HybridTraceForSteps,
 	w: HybridWeights,
 	cfg: ModelConfigLike,
 	plan: HybridPlan,
-	prefix: string
+	prefix: string,
+	/** V4.1 CSA2 角色覆盖（Reuse / Reindex / Full）；V4 各层自算时省略 */
+	diagramRole?: { variant: V4Variant; src?: number; srcAction?: string }
 ): Step[] {
 	const { H, hd, dn, dr, qr } = hybridDims(cfg, plan);
 	const S = cfg.seq_len;
 	const D = cfg.d_model;
-	const variant = variantOf(plan);
-	const flow = (active: string[]) => v4Diagram(variant, active);
+	const variant = diagramRole?.variant ?? variantOf(plan);
+	const flow = (active: string[]) =>
+		v4Diagram(variant, active, diagramRole?.src, diagramRole?.srcAction);
 	const X = ref('X', trace.x, [S, D], [S, R.d_model], 'input');
 	const ropeNote =
 		plan.ratio > 0
@@ -513,58 +575,105 @@ export function hybridHeadSteps(
 		},
 
 		// ── Q 支路之二：每头归一化 → RoPE（一条链，rope 那几维算到才框出来） ──
-		{
-			id: `${prefix}-q-norm-rope`,
-			kind: 'ROPE',
-			diagram: flow(['q']),
-			label: `**按头**处理，一个头一个头地做：先各自过一次 RMSNorm，再对**末尾 ${dr} 维**（真实 ${R.rope_head_dim} 维）做 RoPE——前面 ${dn} 维（真实 ${R.head_dim - R.rope_head_dim} 维）是 nope，原样不动。**每个头都做同样的事**，这里只演示 head 0（上一页那 ${H * hd} 列里的前 ${hd} 列）；下面整块矩阵画的是 head 0，**算到 RoPE 那一步才把末尾 ${dr} 维框出来**。${ropeNote}`,
-			formula: 'q=\\mathcal{R}\\!\\left(\\mathrm{RMSNorm}(q)\\right)\\ \\text{（逐头）}',
-			tensors: [
-				{
-					name: `${prefix}-q-head-norm-rope`,
-					kind: 'transform',
-					shape: [S, hd],
-					cellSize: 32,
-					op: 'RMSNorm（每头）',
-					input: ref(
-						'q_0',
-						trace.qUp.map((r) => r.slice(0, hd)),
-						[S, hd],
-						[S, R.head_dim],
-						'head',
-						'← head 0（上一页那 8 列的前 4 列）'
-					),
-					output: ref(
-						'q_0~',
-						trace.qFlat.map((r) => r.slice(0, hd)),
-						[S, hd],
-						[S, R.head_dim],
-						'head',
-						'← 整头都归一化了'
-					),
-					// RoPE 挂在链尾：整块矩阵只画一次，"末尾 dr 维"在这一段才被框出来
-					tail: {
-						op: 'RoPE',
-						result: ref(
-							'q_0′',
-							trace.q[0],
-							[S, hd],
-							[S, R.head_dim],
-							'head',
-							`← 框出的末尾 ${dr} 维转完；前面 ${dn} 维原样`
-						),
-						highlightCols: Array.from({ length: dr }, (_, i) => dn + i)
+		// V4（q_head_norm=true）：先每头 RMSNorm、再 RoPE（链尾框末尾 dr 维）；
+		// V4.1（=false）：删了每头 RMSNorm——Q 只做 RoPE（整块矩阵 + highlightCols 同一套格式）。
+		...(cfg.q_head_norm === false
+			? ([
+					{
+						id: `${prefix}-q-rope`,
+						kind: 'ROPE',
+						diagram: flow(['q']),
+						label: `**V4.1 删了每头 RMSNorm**（q_head_norm=false）：Q 直接对**末尾 ${dr} 维**（真实 ${R.rope_head_dim} 维）做 RoPE——前面 ${dn} 维（真实 ${R.head_dim - R.rope_head_dim} 维）是 nope，原样不动。**每个头都做同样的事**，这里只演示 head 0（上一页那 ${H * hd} 列里的前 ${hd} 列）；下面整块矩阵画的是 head 0，**算到 RoPE 那一步才把末尾 ${dr} 维框出来**。${ropeNote}`,
+						formula: 'q=\\mathcal{R}(q)\\ \\text{（逐头，无每头 RMSNorm）}',
+						tensors: [
+							{
+								name: `${prefix}-q-rope`,
+								kind: 'transform',
+								shape: [S, hd],
+								cellSize: 32,
+								op: 'RoPE',
+								input: ref(
+									'q_0',
+									trace.qUp.map((r) => r.slice(0, hd)),
+									[S, hd],
+									[S, R.head_dim],
+									'head',
+									'← head 0（上一页那 8 列的前 4 列，没做每头归一化）'
+								),
+								output: ref(
+									'q_0′',
+									trace.q[0],
+									[S, hd],
+									[S, R.head_dim],
+									'head',
+									`← 框出的末尾 ${dr} 维转完；前面 ${dn} 维原样`
+								),
+								highlightCols: Array.from({ length: dr }, (_, i) => dn + i)
+							},
+							{
+								name: `${prefix}-q-head-note`,
+								kind: 'shape',
+								wide: true,
+								shape: [S, H, hd],
+								note: `**真实每头 ${R.head_dim} 维 = ${R.head_dim - R.rope_head_dim} 维 nope + ${R.rope_head_dim} 维 rope**：RoPE 只作用在**末尾**那 ${R.rope_head_dim} 维（这里缩成 ${dr} 维，列缩小 32×）——前 ${R.head_dim - R.rope_head_dim} 维是 nope，转完原样拼回去。**V4.1 没有每头 RMSNorm**（对比 V4：先整头归一化再转）；旋转保范数，只改方向不改长度`
+							}
+						]
 					}
-				},
-				{
-					name: `${prefix}-q-head-note`,
-					kind: 'shape',
-					wide: true,
-					shape: [S, H, hd],
-					note: `**真实每头 ${R.head_dim} 维 = ${R.head_dim - R.rope_head_dim} 维 nope + ${R.rope_head_dim} 维 rope**：RMSNorm 是整头做的（${hd} 维 = 真实 ${R.head_dim}），RoPE 只作用在**末尾**那 ${R.rope_head_dim} 维（这里缩成 ${dr} 维，列缩小 32×）——前 ${R.head_dim - R.rope_head_dim} 维是 nope，转完原样拼回去。两步都是**逐行**做的：同一个 token 的 ${H} 个头各自归一化、各自旋转，互不影响；旋转保范数，只改方向不改长度`
-				}
-			]
-		},
+				] as Step[])
+			: ([
+					{
+						id: `${prefix}-q-norm-rope`,
+						kind: 'ROPE',
+						diagram: flow(['q']),
+						label: `**按头**处理，一个头一个头地做：先各自过一次 RMSNorm，再对**末尾 ${dr} 维**（真实 ${R.rope_head_dim} 维）做 RoPE——前面 ${dn} 维（真实 ${R.head_dim - R.rope_head_dim} 维）是 nope，原样不动。**每个头都做同样的事**，这里只演示 head 0（上一页那 ${H * hd} 列里的前 ${hd} 列）；下面整块矩阵画的是 head 0，**算到 RoPE 那一步才把末尾 ${dr} 维框出来**。${ropeNote}`,
+						formula: 'q=\\mathcal{R}\\!\\left(\\mathrm{RMSNorm}(q)\\right)\\ \\text{（逐头）}',
+						tensors: [
+							{
+								name: `${prefix}-q-head-norm-rope`,
+								kind: 'transform',
+								shape: [S, hd],
+								cellSize: 32,
+								op: 'RMSNorm（每头）',
+								input: ref(
+									'q_0',
+									trace.qUp.map((r) => r.slice(0, hd)),
+									[S, hd],
+									[S, R.head_dim],
+									'head',
+									'← head 0（上一页那 8 列的前 4 列）'
+								),
+								output: ref(
+									'q_0~',
+									trace.qFlat.map((r) => r.slice(0, hd)),
+									[S, hd],
+									[S, R.head_dim],
+									'head',
+									'← 整头都归一化了'
+								),
+								// RoPE 挂在链尾：整块矩阵只画一次，"末尾 dr 维"在这一段才被框出来
+								tail: {
+									op: 'RoPE',
+									result: ref(
+										'q_0′',
+										trace.q[0],
+										[S, hd],
+										[S, R.head_dim],
+										'head',
+										`← 框出的末尾 ${dr} 维转完；前面 ${dn} 维原样`
+									),
+									highlightCols: Array.from({ length: dr }, (_, i) => dn + i)
+								}
+							},
+							{
+								name: `${prefix}-q-head-note`,
+								kind: 'shape',
+								wide: true,
+								shape: [S, H, hd],
+								note: `**真实每头 ${R.head_dim} 维 = ${R.head_dim - R.rope_head_dim} 维 nope + ${R.rope_head_dim} 维 rope**：RMSNorm 是整头做的（${hd} 维 = 真实 ${R.head_dim}），RoPE 只作用在**末尾**那 ${R.rope_head_dim} 维（这里缩成 ${dr} 维，列缩小 32×）——前 ${R.head_dim - R.rope_head_dim} 维是 nope，转完原样拼回去。两步都是**逐行**做的：同一个 token 的 ${H} 个头各自归一化、各自旋转，互不影响；旋转保范数，只改方向不改长度`
+							}
+						]
+					}
+				] as Step[])),
 
 		// ── KV 支路：归一化 → RoPE（只有一个头，K = V） ──
 		{
@@ -610,23 +719,30 @@ export function hybridHeadSteps(
 
 /** 后段：一次融合注意力 → 逆 RoPE + 分组输出投影 → 缓存 */
 export function hybridTailSteps(
-	trace: HybridTrace,
+	trace: HybridTraceForSteps,
 	w: HybridWeights,
 	cfg: ModelConfigLike,
 	plan: HybridPlan,
-	prefix: string
+	prefix: string,
+	/** V4.1 消费者层（Reuse / Reindex）共享的池来源层号；V4 各层自算时为 `undefined` */
+	poolSrc?: number,
+	/** V4.1 CSA2 角色覆盖（Reuse / Reindex / Full）；V4 各层自算时省略 */
+	diagramRole?: { variant: V4Variant; src?: number; srcAction?: string }
 ): Step[] {
 	const { H, hd, dn, dr, G, oLora, W, perGroup } = hybridDims(cfg, plan);
 	const S = cfg.seq_len;
 	const D = cfg.d_model;
 	const nE = trace.nE;
 	const cols = trace.cols;
-	const variant = variantOf(plan);
-	const flow = (active: string[]) => v4Diagram(variant, active);
+	const variant = diagramRole?.variant ?? variantOf(plan);
+	const flow = (active: string[]) =>
+		v4Diagram(variant, active, diagramRole?.src, diagramRole?.srcAction);
+	// V4.1 的 Q 页没有每头 RMSNorm，步骤 id 是 `-q-rope`（V4 是 `-q-norm-rope`）
+	const qRopeRef = cfg.q_head_norm === false ? `${prefix}-q-rope` : `${prefix}-q-norm-rope`;
 
 	const colLayout = [
 		`前 ${S} 列 = 每个 token 的精确 KV（**蓝框**；每行只留滑窗内那 ${W} 个）`,
-		nE ? `接着 ${nE} 列 = 压缩条目（**琥珀框**）` : null,
+		nE ? (poolSrc ? `接着 ${nE} 列 = 第 ${poolSrc} 层共享的压缩 KV（**琥珀框**）` : `接着 ${nE} 列 = 压缩条目（**琥珀框**）`) : null,
 		`最后 1 列 = sink 空槽`
 	]
 		.filter(Boolean)
@@ -647,11 +763,17 @@ export function hybridTailSteps(
 								to: S + nE - 1,
 								label: `压缩列 ← 第 {{step:${prefix}-indexer-logits}} 步的 top-k 选择（选中才保留）`
 							}
-						: {
-								from: S,
-								to: S + nE - 1,
-								label: '压缩列 ← 写出的条目全保留（HCA 不检索，稠密）'
-							}
+						: poolSrc
+							? {
+									from: S,
+									to: S + nE - 1,
+									label: `压缩列 ← 第 ${poolSrc} 层的 top-k 选择（本层不重选，直接读）`
+								}
+							: {
+									from: S,
+									to: S + nE - 1,
+									label: '压缩列 ← 写出的条目全保留（HCA 不检索，稠密）'
+								}
 				]
 			: []),
 		{ from: S + nE, to: S + nE, label: 'sink 列 ← 恒保留（每头一个偏置，只进分母）' }
@@ -702,8 +824,10 @@ export function hybridTailSteps(
 	];
 	if (trace.compKv) {
 		cacheBlocks.push({
-			name: '压缩 KV',
-			label: `每 ${plan.ratio} 个 token 压出 1 条，共 ${nE} 条`,
+			name: poolSrc ? `第 ${poolSrc} 层的压缩 KV` : '压缩 KV',
+			label: poolSrc
+				? `由第 ${poolSrc} 层写入，本层按 loc//${plan.ratio} 直接读（不重算），共 ${nE} 条`
+				: `每 ${plan.ratio} 个 token 压出 1 条，共 ${nE} 条`,
 			size: hd,
 			realSize: R.head_dim,
 			data: trace.compKv
@@ -720,7 +844,7 @@ export function hybridTailSteps(
 			kind: 'MATMUL',
 			diagram: flow(['q', 'kv', 'ckv', 'itop']),
 			label: nE
-				? `每个头算 Q_h·K_hᵀ 再除以 √${hd} 缩放，得到分数矩阵 S。K 是**所有真实列**拼起来的：前 ${S} 列是每个 token 的**精确 KV**（**蓝框**；每行只有滑窗内那 ${W} 个是活的，其余会被掩码）、后 ${nE} 列是**压缩条目**（**琥珀框**）——所以这一步就把"局部精确 + 远处压缩"放进同一个矩阵了。sink 偏置**不在这里**（它不是点积，是直接加在分数上的一项，见下）`
+				? `每个头算 Q_h·K_hᵀ 再除以 √${hd} 缩放，得到分数矩阵 S。K 是**所有真实列**拼起来的：前 ${S} 列是每个 token 的**精确 KV**（**蓝框**；每行只有滑窗内那 ${W} 个是活的，其余会被掩码）、后 ${nE} 列是${poolSrc ? `**第 ${poolSrc} 层共享的压缩 KV**（**琥珀框**）——本层不重算，直接读` : '**压缩条目**（**琥珀框**）'}——所以这一步就把"局部精确 + 远处压缩"放进同一个矩阵了。sink 偏置**不在这里**（它不是点积，是直接加在分数上的一项，见下）`
 				: `每个头算 Q_h·K_hᵀ 再除以 √${hd} 缩放，得到分数矩阵 S。K 就是滑窗里那 ${S} 个 token 的精确 KV（单头，K = V）。sink 偏置**不在这里**（它不是点积，是直接加在分数上的一项，见下）`,
 			formula: 'S_h=\\frac{Q_hK_h^{\\top}}{\\sqrt{d_h}}',
 			tensors: [
@@ -734,7 +858,7 @@ export function hybridTailSteps(
 						[S, hd],
 						[S, R.head_dim],
 						'head',
-						`← 第 {{step:${prefix}-q-norm-rope}} 步算出的 q（已过 RoPE），这里演示 head 0`
+						`← 第 {{step:${qRopeRef}}} 步算出的 q（已过 RoPE），这里演示 head 0`
 					),
 					b: ref(
 						'K_hᵀ',
@@ -743,7 +867,9 @@ export function hybridTailSteps(
 						[R.head_dim, S + nE],
 						'head',
 						nE
-							? `← 转置之后：前 ${S} 列是每个 token 的精确 KV（**蓝框**）、后 ${nE} 列是压缩条目（**琥珀框**）`
+							? poolSrc
+								? `← 转置之后：前 ${S} 列是每个 token 的精确 KV（**蓝框**）、后 ${nE} 列是第 ${poolSrc} 层共享的压缩 KV（**琥珀框**）`
+								: `← 转置之后：前 ${S} 列是每个 token 的精确 KV（**蓝框**）、后 ${nE} 列是压缩条目（**琥珀框**）`
 							: '← 转置之后，每一列是一个 token 的 K',
 						kvColBands
 					),
@@ -784,7 +910,13 @@ export function hybridTailSteps(
 				`掩码规则：j > i（因果）、超出滑窗、没被 indexer 选中——三种都置 ∅（≈ −∞：softmax 后权重为 0）` +
 				(nE ? `，但被拒的压缩条目**分数其实还在**（淡显的那些格子）` : '') +
 				`。掩码**分三段依次播**（进度条实时标当前段的来源）：token 列 ← 滑窗规则、` +
-				(nE ? `${trace.indexer ? '压缩列 ← 上一页 top-k 选中的' : '压缩列 ← 写出的全保留（HCA 稠密）'}、` : '') +
+				(nE
+					? `${trace.indexer
+							? '压缩列 ← 上一页 top-k 选中的'
+							: poolSrc
+								? `压缩列 ← 第 ${poolSrc} 层的 top-k（本层不重选）`
+								: '压缩列 ← 写出的全保留（HCA 稠密）'}、`
+						: '') +
 				`sink 列 ← 恒保留——这张矩阵的掩码**完全由这几块来源拼成**。` +
 				`上一页的分数右边**再接上 sink 那一列**（${colLayout}）——滑窗和压缩历史进的是同一个 softmax，` +
 				`不是"各算一遍再合并"；sink 只进分母、没有位置（见下面那块小字）。` +

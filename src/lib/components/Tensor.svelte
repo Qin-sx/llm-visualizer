@@ -47,6 +47,7 @@
 		view.kind === 'sum' ||
 		view.kind === 'lookup' ||
 		view.kind === 'kvcache' ||
+		view.kind === 'ewise' ||
 		// tiles 是"并排的几个小矩阵"（各头分数、复制出来的 K/V），
 		// 落在默认的 220px 网格列里会折成 3+1 两行，占满整行才排得开
 		view.kind === 'tiles'}

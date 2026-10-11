@@ -172,7 +172,7 @@ export const V4_FLASH_CFG: ModelConfigLike & { seed: number } = {
 	hc_eps: 1e-6,
 
 	// ── hash 路由（V4 前几层不学路由）──────
-	// 真实 `num_hash_layers = 3`（前 3 层 hash），demo 用前 2 层（doc/09 §1.1 定的）：
+	// 真实 `num_hash_layers = 3`（前 3 层 hash），demo 用前 2 层：
 	// 前 2 层（SWA 那两层）的 MoE 不学路由，直接按 token id 查哈希表选专家。
 	n_hash_layers: 2,
 
@@ -209,7 +209,7 @@ export const REAL_V4_FLASH = {
 } as const;
 
 /** 真实维度（界面上标注"真实 size 是多少、缩小了几倍"用） */
-export type RealDims = typeof REAL_R1 | typeof REAL_V4_FLASH;
+export type RealDims = typeof REAL_R1 | typeof REAL_V4_FLASH | typeof REAL_V4_1;
 
 /**
  * 一个**代表模型**：缩放配置 + 真实维度 + 逐层结构。
@@ -231,6 +231,11 @@ export interface ModelSpec {
 	attnChoices: string[];
 	/** 层选择器上每层的标注（如 `dense` / `MoE` / `SWA` / `C4` / `C128`） */
 	layerLabels: string[];
+	/**
+	 * 层选择器上的**分段标注**（可选）：在 `from` 号 chip 前面插一个分隔标签。
+	 * V4.1 的 CED 用它标"编码器段 / 解码器段"（demo：编码器 0-4、解码器 5-7）。
+	 */
+	layerSegments?: { label: string; from: number }[];
 	/**
 	 * 层故事里的残差形态：
 	 * `none` = 没有残差阶段；`plain` = 普通残差（x + 子层输出，每层两次）；`mhc` = V4 的 mHC
@@ -268,7 +273,151 @@ export const V4_FLASH_MODEL: ModelSpec = {
 	residual: 'mhc'
 };
 
-export const MODELS: ModelSpec[] = [R1_MODEL, V4_FLASH_MODEL];
+// ── DeepSeek V4.1-Flash ─────────────────────────────────
+/**
+ * V4.1-Flash 的缩放版（对照真实 config.json 逐条过完 verify 约束）：
+ *
+ *   `compress_ratios = [0,0,2,2,2,1,1,1]`（8 层）——层 0-1 纯 SWA、
+ *   层 2 一个 ratio-2 Full（组 = 2-4）、层 5 一个 ratio-1 Full（= 候选源，组 = 5-7）、
+ *   层 6 一个 Reindex（池内重打分）、其余 Reuse。
+ *
+ * 与 V4 的两处结构性差别（CSA2 / CED）：
+ *   ① **只有 kv_source 层写压缩 KV**（`[2,5]`），其余层读共享池（`loc//ratio` 纯算术寻址）；
+ *   ② **层 5 的全局 KV 从"编码器末态"投影**（层 4 的输出），解码器段共享这一份；
+ *   ③ 压缩比只有 1 / 2（没有 4 / 128），**无重叠窗口、无 ape**；
+ *   ④ `q_head_norm = false`（V4.1 删了每头 RMSNorm）；
+ *   ⑤ Single-Pass mHC（`hc_pre_from_prev_sublayer = true`，数值上与顺序执行等价）。
+ *
+ * 格子尺寸的边界核算（C1）：`seq_len = 8` 是上界——最宽的一处是
+ * 层 5 的打分矩阵（8 滑窗 + 8 全局 + 1 sink = 17 列 → 总列数 38 → 23px ≥ 20px），
+ * 它的 softmax 链（`transformCellSize(17, hasTail)`）恰在 20px 边界，seq 不能再涨。
+ */
+export const V4_1_CFG: ModelConfigLike & { seed: number } = {
+	seq_len: 8,
+	vocab_size: 12,
+	causal: true,
+
+	num_layers: 8, // 真实 40（20 编码器 + 20 解码器）+ 3 DSpark 草稿
+	d_model: 8,
+	first_k_dense: 0, // 全 MoE
+
+	// ── 混合注意力（CSA2）─────────────────
+	// 头维与 V4 demo 一致（nope 2 + rope 2）；q_head_norm 关掉（V4.1 删每头 RMSNorm）
+	num_heads: 2,
+	head_dim: 4,
+	qk_nope_head_dim: 2,
+	qk_rope_head_dim: 2,
+	v_head_dim: 4, // K = V 共享
+	q_lora_rank: 4,
+
+	swa_window: 4,
+	compress_ratios: [0, 0, 2, 2, 2, 1, 1, 1],
+	rope_theta: 10000,
+	compress_rope_theta: 40000, // 演示值沿用 V4 demo（真实 160000）
+
+	// ── CSA2 层间共享（核心）───────────────
+	kv_source_layer_ids: [2, 5], // 层 2 = 编码器组 Full；层 5 = 解码器全局 KV 的 Full（= 候选源）
+	index_source_layer_ids: [2, 5, 6], // 层 2/5 的 Full 自跑 indexer；层 6 = Reindex（池内重打分）
+	candidate_source_layer_id: 5,
+	candidate_topk_blocks: 2, // 真实 2048
+	candidate_block_size: 2, // 真实 8 —— 候选池 = 2×2 = 4 条（真实 16,384）
+	index_n_heads: 2,
+	index_head_dim: 2,
+	index_topk: 2, // 固定计数（不是比例）——这本身就是真实的语义
+
+	o_groups: 2,
+	o_lora_rank: 4,
+
+	// ── mHC（Single-Pass 变体）────────────
+	hc_mult: 2, // 真实 4，演示 2 条流
+	hc_sinkhorn_iters: 20,
+	hc_eps: 1e-6,
+	hc_pre_from_prev_sublayer: true, // V4.1 = Single-Pass mHC
+	q_head_norm: false, // V4.1 删每头 RMSNorm
+
+	// ── MoE（无 hash 路由——V4.1 配置没有 num_hash_layers）──
+	dense_intermediate: 8, // V4.1 没有 dense 层，字段用不上（类型要求）
+	moe_intermediate: 4,
+	num_routed_experts: 4,
+	num_shared_experts: 1,
+	top_k: 2,
+	n_hash_layers: 0,
+
+	seed: 42
+};
+
+/** DeepSeek V4.1-Flash 真实 config（`model/ds-v4.1-flash/config.json`） */
+export const REAL_V4_1 = {
+	num_layers: 40,
+	d_model: 5120,
+	num_heads: 64,
+	head_dim: 512, // nope 448 + rope 64（真实 head_dim 512，qk_rope 64）
+	rope_head_dim: 64,
+	v_head_dim: 512, // K = V 共享
+	q_lora_rank: 1280,
+	swa_window: 128,
+	compress_rope_theta: 160000,
+	index_topk: 512,
+	index_n_heads: 32,
+	index_head_dim: 128,
+	o_groups: 8,
+	o_lora_rank: 1024,
+	moe_intermediate: 2304,
+	num_routed_experts: 384,
+	num_shared_experts: 1,
+	top_k: 6,
+	vocab_size: 129280,
+	// mHC：与 V4 一致（hc_mult 4 / Sinkhorn 20 / eps 1e-6），Single-Pass（pre_from_prev=true）
+	hc_mult: 4,
+	hc_sinkhorn_iters: 20,
+	hc_eps: 1e-6,
+	// CSA2 / CED（真实 config.json）
+	kv_sources: [2, 8, 14, 20],
+	index_sources: [2, 8, 14, 20, 24, 28, 32, 36],
+	candidate_source: 20,
+	candidate_topk_blocks: 2048,
+	candidate_block_size: 8
+} as const;
+
+/** V4.1-Flash：全 MoE + CSA2（Full / Reindex / Reuse）逐层固定 */
+export const V4_1_FLASH_MODEL: ModelSpec = {
+	id: 'v4.1-flash',
+	name: 'DeepSeek V4.1-Flash',
+	desc: '40 层 CED（20 编码器 + 20 解码器）+ CSA2：只有 4 层写压缩 KV、8 层跑索引、其余 30 层搭便车；压缩比 1 / 2（无重叠、无 ape）、q_head_norm 关闭、Single-Pass mHC。这里缩成 8 层：2 纯 SWA + ratio-2 一组（层 2 Full）+ ratio-1 一组（层 5 Full / 层 6 Reindex）。',
+	cfg: V4_1_CFG,
+	real: REAL_V4_1,
+	ffnByLayer: [
+		'deepseek-moe',
+		'deepseek-moe',
+		'deepseek-moe',
+		'deepseek-moe',
+		'deepseek-moe',
+		'deepseek-moe',
+		'deepseek-moe',
+		'deepseek-moe'
+	],
+	attnByLayer: [
+		'swa',
+		'swa',
+		'csa2-full',
+		'csa2-reuse',
+		'csa2-reuse',
+		'csa2-full',
+		'csa2-reindex',
+		'csa2-reuse'
+	],
+	attnChoices: [],
+	layerLabels: ['SWA', 'SWA', 'C2-F', 'C2-R', 'C2-R', 'C1-F', 'C1-I', 'C1-R'],
+	// CED：层 0-4 = 编码器（含纯 SWA 与 ratio-2 组）、层 5-7 = 解码器（ratio-1，共享全局 KV）
+	layerSegments: [
+		{ label: '编码器', from: 0 },
+		{ label: '解码器', from: 5 }
+	],
+	// V4.1 的残差是 mHC（Single-Pass 变体，数值与 V4 相同）
+	residual: 'mhc'
+};
+
+export const MODELS: ModelSpec[] = [R1_MODEL, V4_FLASH_MODEL, V4_1_FLASH_MODEL];
 
 export function getModel(id: string): ModelSpec {
 	return MODELS.find((m) => m.id === id) ?? R1_MODEL;

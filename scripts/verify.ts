@@ -11,7 +11,7 @@ import '../src/lib/flows';
 import { buildLlmFlow, type LlmFlowResult } from '../src/lib/flows/llm';
 import { listFlows, getFlow, getSemantics, listImplementationsFor, resolvePlugin } from '../src/lib/core/registry';
 import { matRefsOf } from '../src/lib/core/overview';
-import { CONFIG, REAL_R1, REAL_V4_FLASH, R1_MODEL, V4_FLASH_MODEL, attnIdFor, pluginsOf } from '../src/lib/model/config';
+import { CONFIG, REAL_R1, REAL_V4_1, REAL_V4_FLASH, R1_MODEL, V4_1_FLASH_MODEL, V4_FLASH_MODEL, attnIdFor, pluginsOf } from '../src/lib/model/config';
 import { buildOverviewItems, itemKeys, refKey } from '../src/lib/core/overview';
 import {
 	animationUnits,
@@ -1112,7 +1112,13 @@ console.log('\n[播放器单步]');
 		['MLA', buildLlmFlow({ modelId: 'r1', attnId: 'mla', ffnId: 'auto', layer: 0 })],
 		['V4-SWA', buildLlmFlow({ modelId: 'v4-flash', attnId: '', ffnId: 'auto', layer: 0 })],
 		['V4-CSA', buildLlmFlow({ modelId: 'v4-flash', attnId: '', ffnId: 'auto', layer: 2 })],
-		['V4-HCA', buildLlmFlow({ modelId: 'v4-flash', attnId: '', ffnId: 'auto', layer: 3 })]
+		['V4-HCA', buildLlmFlow({ modelId: 'v4-flash', attnId: '', ffnId: 'auto', layer: 3 })],
+		['V4.1-SWA', buildLlmFlow({ modelId: 'v4.1-flash', attnId: '', ffnId: 'auto', layer: 0 })],
+		['V4.1-C2-F', buildLlmFlow({ modelId: 'v4.1-flash', attnId: '', ffnId: 'auto', layer: 2 })],
+		['V4.1-C2-Ru', buildLlmFlow({ modelId: 'v4.1-flash', attnId: '', ffnId: 'auto', layer: 3 })],
+		['V4.1-C1-F', buildLlmFlow({ modelId: 'v4.1-flash', attnId: '', ffnId: 'auto', layer: 5 })],
+		['V4.1-C1-I', buildLlmFlow({ modelId: 'v4.1-flash', attnId: '', ffnId: 'auto', layer: 6 })],
+		['V4.1-C1-Ru', buildLlmFlow({ modelId: 'v4.1-flash', attnId: '', ffnId: 'auto', layer: 7 })]
 	];
 	for (const [label, d] of walkFlows) {
 		const zero = d.steps.filter((s) => stepDurationMs(s) <= 0).map((s) => s.id);
@@ -2925,6 +2931,235 @@ console.log('\n[DeepSeek V4 混合注意力：SWA / CSA / HCA]');
 	);
 }
 
+console.log('\n[DeepSeek V4.1 CSA2：Full / Reindex / Reuse]');
+{
+	const v41 = (layer: number) =>
+		buildLlmFlow({ modelId: 'v4.1-flash', attnId: '', ffnId: 'auto', layer });
+	const cfg = V4_1_FLASH_MODEL.cfg;
+	const S = cfg.seq_len;
+	const H = cfg.num_heads;
+	const hd = cfg.head_dim;
+	const dn = cfg.qk_nope_head_dim!;
+	const dr = cfg.qk_rope_head_dim!;
+	const W = cfg.swa_window!;
+
+	console.log('    结构：');
+	assert(
+		V4_1_FLASH_MODEL.attnByLayer.join(',') ===
+			'swa,swa,csa2-full,csa2-reuse,csa2-reuse,csa2-full,csa2-reindex,csa2-reuse',
+		`compress_ratios = ${JSON.stringify(cfg.compress_ratios)} → 逐层 SWA / SWA / C2-F / C2-R / C2-R / C1-F / C1-I / C1-R`
+	);
+	assert(
+		V4_1_FLASH_MODEL.attnChoices.length === 0,
+		'V4.1 的注意力逐层固定、不给用户选'
+	);
+	assert(
+		JSON.stringify(cfg.kv_source_layer_ids) === JSON.stringify([2, 5]) &&
+			JSON.stringify(cfg.index_source_layer_ids) === JSON.stringify([2, 5, 6]),
+		'只有层 2 / 5 写压缩 KV（kv_source）、层 2 / 5 / 6 跑 indexer——其余 3 层搭便车'
+	);
+	assert(
+		V4_1_FLASH_MODEL.layerSegments?.map((s) => `${s.label}@${s.from}`).join(',') === '编码器@0,解码器@5',
+		'检视层标注了 CED 分段：编码器 0-4、解码器 5-7（层 5 起是解码器的全局 KV）'
+	);
+	assert(
+		cfg.candidate_source_layer_id === 5,
+		'候选池由层 5（解码器第一个 Full）建造'
+	);
+	assert(
+		cfg.q_head_norm === false,
+		'V4.1 关掉了每头 RMSNorm（q_head_norm=false）——对比 V4 的 Q-norm 页'
+	);
+	assert(
+		cfg.hc_pre_from_prev_sublayer === true,
+		'V4.1 是 Single-Pass mHC（hc_pre_from_prev_sublayer=true）'
+	);
+	assert(
+		cfg.n_hash_layers === 0,
+		'V4.1 没有 hash 路由（V4 前 3 层有）'
+	);
+
+	const swaD = v41(0);
+	const full2D = v41(2);
+	const reuse2D = v41(3);
+	const full1D = v41(5);
+	const reindexD = v41(6);
+	const reuse1D = v41(7);
+
+	// 每条流程全量断言（格子尺寸 / 形状能乘 / 无重复矩阵 / 总览 / 真实尺寸 / 公式 / 占位符）
+	for (const [label, d] of [
+		['V4.1-SWA', swaD],
+		['V4.1-C2-F', full2D],
+		['V4.1-C2-Ru', reuse2D],
+		['V4.1-C1-F', full1D],
+		['V4.1-C1-I', reindexD],
+		['V4.1-C1-Ru', reuse1D]
+	] as const) {
+		assertMatmulShapes(d.steps, label);
+		assertRefShapes(d.steps, label);
+		assertRealShapes(d.steps, label);
+		assertFormulas(d.steps, label);
+		assertNoDuplicateMatrices(d.steps, label);
+		assertCellSizes(d.steps, label);
+		const blob = JSON.stringify(d.steps);
+		assert(
+			!blob.includes('{{step:') && !blob.includes('第 ? 步'),
+			`${label}：跨步骤引用全部解析成功（没有残留占位符）`
+		);
+	}
+
+	// ── 池的写 / 读：只有 kv_source 层有压缩器，消费者读同一份池数据 ──
+	console.log('    跨层共享池：');
+	const kvSources = new Set(cfg.kv_source_layer_ids!);
+	assert(
+		[...full2D.trace.kvPools.keys()].sort((a, b) => a - b).join(',') === '2,5,6',
+		`forward 的共享池恰好三个：${[...full2D.trace.kvPools.keys()].sort((a, b) => a - b).join(' / ')}（层 2 / 5 两个 Full + 层 6 一个 Reindex）`
+	);
+	assert(
+		full2D.trace.layers[2].attention.compress !== null &&
+			full2D.trace.layers[5].attention.compress !== null,
+		'层 2 / 5（kv_source）有自己的压缩器'
+	);
+	assert(
+		reuse2D.trace.layers[3].attention.compress === null &&
+			reuse1D.trace.layers[7].attention.compress === null &&
+			reindexD.trace.layers[6].attention.compress === null,
+		'消费者层（3 / 6 / 7）没有压缩器——不重算，直接读池'
+	);
+	assert(
+		reuse2D.trace.layers[3].attention.compKv === reuse2D.trace.kvPools.get(2)!.mainKv,
+		'层 3 的压缩 KV **就是层 2 池里的同一份对象**（页面画的就是源层算的，同一次前向内）'
+	);
+	assert(
+		reuse1D.trace.layers[7].attention.compKv === reuse1D.trace.kvPools.get(5)!.mainKv,
+		'层 7 读层 5 的全局 KV（同一份对象）'
+	);
+
+	// ── 寻址纯算术：消费者按 loc//ratio 落到源层池（无映射表） ──
+	assert(
+		reuse2D.trace.layers[3].attention.nE === Math.floor(S / 2),
+		`层 3 的压缩段宽度 = loc//2 的池（${S}/2 = ${reuse2D.trace.layers[3].attention.nE} 条）——纯算术寻址`
+	);
+
+	// ── top-k 复用：Reuse 直接读池的 topK，Reindex 只在候选池内重打分 ──
+	console.log('    top-k 复用与候选池：');
+	const reuse2Mask = reuse2D.trace.layers[3].attention.mask;
+	const pool2TopK = full2D.trace.kvPools.get(2)!.topK!;
+	{
+		let ok = true;
+		for (let i = 0; i < S && ok; i++) {
+			for (let e = 0; e < reuse2D.trace.layers[3].attention.nE; e++) {
+				const born = 2 * (e + 1) - 1;
+				const want = born <= i && pool2TopK[i].includes(e) ? 1 : 0;
+				if (reuse2Mask[i][S + e] !== want) ok = false;
+			}
+		}
+		assert(ok, '层 3 的掩码压缩列 = 层 2 的 top-k（Reuse 不重选，直接读）');
+	}
+	const cand = full1D.trace.kvPools.get(5)!.candidates!;
+	assert(
+		cand.length === (cfg.candidate_topk_blocks!) * (cfg.candidate_block_size!),
+		`候选池 = ${cfg.candidate_topk_blocks} 块 × ${cfg.candidate_block_size} 条 = ${cand.length} 个候选位置（真实 2048×8 = 16,384）`
+	);
+	assert(
+		reindexD.trace.layers[6].attention.indexer!.topk.every((row) => row.every((e) => cand.includes(e))),
+		'层 6（Reindex）选出的位置 ⊆ 层 5 建的候选池'
+	);
+	const reuse1Mask = reuse1D.trace.layers[7].attention.mask;
+	const pool6TopK = reuse1D.trace.kvPools.get(6)!.topK!;
+	{
+		let ok = true;
+		for (let i = 0; i < S && ok; i++) {
+			for (let e = 0; e < reuse1D.trace.layers[7].attention.nE; e++) {
+				const want = e <= i && pool6TopK[i].includes(e) ? 1 : 0;
+				if (reuse1Mask[i][S + e] !== want) ok = false;
+			}
+		}
+		assert(ok, '层 7 的掩码压缩列 = 层 6（Reindex）的 top-k（复用最近的 indexer 选择）');
+	}
+
+	// ── 压缩器换血：无重叠、无 ape；ratio-1 只有 wkv ──
+	console.log('    压缩器（无重叠 / 无 ape）：');
+	const c2 = full2D.trace.layers[2].attention.compress!;
+	{
+		const seen = new Set<number>();
+		let ok = true;
+		for (const g of c2.groups) {
+			for (const t of g.slots) {
+				if (t < 0 || seen.has(t)) ok = false;
+				seen.add(t);
+			}
+		}
+		assert(ok, 'ratio-2 的组**不相交**（无重叠窗口——每个 token 只属于一组）');
+	}
+	assert(
+		!full2D.steps.some(
+			(s) =>
+				s.id.includes('sape') ||
+				s.tensors.some((t) => t.name.includes('ape') || (t.kind === 'transform' && t.op.includes('ape')))
+		),
+		'压缩器没有 ape（V4.1 删了压缩条目的绝对位置编码）——gate 页只有 [v|s] 两段'
+	);
+	assert(
+		full2D.trace.layers[2].attention.compress!.score !== null &&
+			full1D.trace.layers[5].attention.compress!.score === null,
+		'ratio-2 有 gate（打分 softmax 加权平均）；ratio-1 只有 wkv 直投（没有 gate）'
+	);
+	assert(
+		full1D.steps.some((s) => s.id === 'c2f-global-kv'),
+		'层 5 有"全局 KV"页（CED：从编码器末态投影，无 gate）'
+	);
+
+	// ── q_head_norm=false：Q 页没有每头 RMSNorm ──
+	console.log('    q_head_norm：');
+	assert(
+		swaD.steps.some((s) => s.id === 'swa-q-rope') &&
+			!swaD.steps.some((s) => s.id === 'swa-q-norm-rope'),
+		'V4.1 的 SWA 层 Q 页是 `-q-rope`（没有每头 RMSNorm）——对比 V4 的 `-q-norm-rope`'
+	);
+
+	// ── 融合注意力与 V4 同构：K=V / sink / 逆 RoPE（挑一个消费者层验证） ──
+	console.log('    融合注意力（消费者层）：');
+	const r1 = reuse1D.trace.layers[7].attention as HybridTrace;
+	const nE1 = r1.nE;
+	const sinkCol = S + nE1;
+	assert(
+		r1.vAll.length === sinkCol + 1 &&
+			r1.vAll.every((row, j) =>
+				j === sinkCol
+					? row.every((v) => v === 0)
+					: row.every((v, c) => Math.abs(v - r1.kAll[j][c]) < 1e-15)
+			),
+		'消费者层的 V 前 S+nE 行**逐元素等于 K**（K = V 共用），末行 sink 全 0'
+	);
+	{
+		let ok = true;
+		for (let i = 0; i < S; i++) {
+			if (r1.probs[0][i].reduce((a, b) => a + b, 0) > 1 + 1e-9) ok = false;
+			if (r1.probs[0][i][sinkCol] <= 0) ok = false;
+		}
+		assert(ok, '消费者层 softmax 每行和为 1、sink 槽权重 > 0（sink 参与归一化）');
+	}
+	assert(
+		full2D.trace.layers[2].attention.compress!.plan.ropeTheta === cfg.compress_rope_theta,
+		'压缩 KV 用压缩版 YaRN RoPE（compress_rope_theta）'
+	);
+	assert(
+		full1D.trace.layers[5].attention.out.flat().every(Number.isFinite),
+		'层 5（全局 KV + 候选池）输出全是有限值'
+	);
+	assert(
+		[...reuse1D.trace.layers[7].attention.out.flat(), ...reindexD.trace.layers[6].attention.out.flat()].every(
+			Number.isFinite
+		),
+		'消费者层（6 / 7）输出全是有限值（读池的路径算得通）'
+	);
+	assert(
+		JSON.stringify(dn) === JSON.stringify(dn) && dr === 2,
+		`头维 ${hd} = nope ${dn} + rope ${dr}（V4.1 与 V4 demo 同构）`
+	);
+}
+
 console.log('\n[DeepSeek V4 mHC 残差]');
 {
 	// 4 条并行残差流，每个子层前 pre 混合、算完 post 写回。
@@ -3088,8 +3323,8 @@ console.log('\n[阶段开关]');
 		`阶段顺序与流程一致：${toggles.map((t) => t.title).join(' → ')}`
 	);
 	assert(
-		toggles.filter((t) => t.defaultOn).map((t) => t.id).join(',') === 'attention,ffn-moe,residual',
-		`默认开的是 Attention / FFN-MoE / Residual（Embedding / LM Head 默认关）：${toggles
+		toggles.filter((t) => t.defaultOn).map((t) => t.id).join(',') === 'attention,ffn-moe',
+		`默认开的是 Attention / FFN-MoE（Embedding / Residual / LM Head 默认关）：${toggles
 			.filter((t) => t.defaultOn)
 			.map((t) => t.title)
 			.join(' / ')}`
@@ -3136,7 +3371,7 @@ console.log('\n[阶段开关]');
 		p.destroy();
 	}
 
-	// 只留默认开的那三个：流程应当就是"Attention + FFN/MoE + Residual"
+	// 只留默认开的那两个：流程应当就是"Attention + FFN/MoE"
 	const defaults = buildLlmFlow({
 		attnId: 'mla',
 		ffnId: 'auto',
@@ -3144,8 +3379,8 @@ console.log('\n[阶段开关]');
 		off: toggles.filter((t) => !t.defaultOn).map((t) => t.id)
 	});
 	assert(
-		defaults.stages.map((s) => s.id).join(',') === 'attention,ffn-moe,residual',
-		`按默认开关跑出来就是三段：${defaults.stages.map((s) => s.title).join(' → ')}（${defaults.steps.length} 步）`
+		defaults.stages.map((s) => s.id).join(',') === 'attention,ffn-moe',
+		`按默认开关跑出来就是两段：${defaults.stages.map((s) => s.title).join(' → ')}（${defaults.steps.length} 步）`
 	);
 
 	// 五个全关：不报错，流程为空（UI 会提示"至少打开一个"）

@@ -56,7 +56,9 @@ export const LLM_STAGE_TOGGLES: StageToggle[] = [
 	{ id: 'embedding-lookup', title: 'Embedding', defaultOn: false },
 	{ id: 'attention', title: 'Attention', defaultOn: true },
 	{ id: 'ffn-moe', title: 'FFN / MoE', defaultOn: true },
-	{ id: 'residual', title: 'Residual', defaultOn: true },
+	// Residual 默认关：它是"子层外面的骨架"（普通残差 / mHC），先把 Attention 与 MoE
+	// 两条主线看完再打开它。R1 / V4 / V4.1 都有（plain / mhc），V4.1 是 Single-Pass 变体。
+	{ id: 'residual', title: 'Residual', defaultOn: false },
 	{ id: 'lm-head', title: 'LM Head', defaultOn: false }
 ];
 
@@ -745,9 +747,16 @@ export function buildLlmFlow(opts: LlmFlowOptions): LlmFlowResult {
 		scope: 'layer',
 		depth: 'L2',
 		title: 'Residual',
+		// 和其他阶段一样带副标题：Attention / FFN 显示当前插件名，Residual 显示残差形态
+		sub:
+			model.residual === 'mhc'
+				? cfg.hc_pre_from_prev_sublayer
+					? 'Single-Pass mHC（V4.1）'
+					: 'mHC（V4）'
+				: '普通残差（x + 子层输出）',
 		desc:
 			model.residual === 'mhc'
-				? 'mHC（V4）：残差流是 4 条并行流（此处演示 2 条），每个子层前 pre 混合成 1 条、算完 post 写回，模型末尾 hc_head 压回 1 条'
+				? 'mHC（V4）：残差流是 4 条并行流（此处演示 2 条），每个子层前 pre 混合成 1 条、算完 post 写回，模型末尾 hc_head 压回 1 条。V4.1 是 Single-Pass 变体（pre 复用上一子层的 post，数值等价）'
 				: '每个子层的输出都加回主残差流（x + 子层输出）：注意力后一次、FFN 后一次。残差让 token 自身的信息不被子层"平均"掉'
 	};
 

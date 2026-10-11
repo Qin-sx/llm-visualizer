@@ -677,7 +677,7 @@ export interface DataflowNode {
 	 * 吸收合并版就是在朴素版那张图上，把折出来的环节标成 `absorbed`、
 	 * 把不再需要的矩阵标成 `gone`——两张图布局完全一样，一眼能看出差在哪。
 	 */
-	tone?: 'input' | 'latent' | 'rope' | 'head' | 'result' | 'cache' | 'weight' | 'absorbed' | 'gone';
+	tone?: 'input' | 'latent' | 'rope' | 'head' | 'result' | 'cache' | 'weight' | 'absorbed' | 'gone' | 'shared';
 	/** 淡显（如"吸收合并后不再走这条路"），配合 `gone` 用 */
 	faded?: boolean;
 	/**
@@ -816,6 +816,44 @@ export interface ModelConfigLike {
 	// hash 路由（DeepSeek V4 前几层不学路由）需要的字段，可选
 	/** 前这么多个层用 hash 路由（真实 V4-Flash = 3）；不填 = 全学（R1） */
 	n_hash_layers?: number;
+
+	// CSA2 / CED（DeepSeek V4.1）需要的字段，可选
+	/** 只有这些层**自己压缩** KV（真实 `[2,8,14,20]`）；其余层直接读 source 层的池 */
+	kv_source_layer_ids?: number[];
+	/** 只有这些层跑 indexer（真实 `[2,8,14,20,24,28,32,36]`）——Full 层自扫、Reindex 层重打分 */
+	index_source_layer_ids?: number[];
+	/** 候选池的建造层（真实 20）：它扫全量并**按块选块**建池，后续 Reindex 层只在池里打分 */
+	candidate_source_layer_id?: number;
+	/** 候选块数（真实 2048） */
+	candidate_topk_blocks?: number;
+	/** 每块多少条压缩条目（真实 8）——候选池 = 块数 × 块大小 条 */
+	candidate_block_size?: number;
+	/** 每头是否过 RMSNorm：V4 = `true`，V4.1 = `false`（关掉） */
+	q_head_norm?: boolean;
+	/** pre-mix 是否用上一子层的结果：V4 = `false`，V4.1 = `true`（Single-Pass mHC） */
+	hc_pre_from_prev_sublayer?: boolean;
+}
+
+/**
+ * V4.1 的**跨层共享 KV 池**（运行期状态，不是权重）。
+ *
+ * 由 `kv_source` 层在 forward 里写入（`forward.ts` 的 `ModelTrace.kvPools`），
+ * Reuse / Reindex 层通过 `LayerCtx.pool(src)` 读取——消费者页面画的就是源层算的
+ * 同一份数据（verify 断言同对象/逐元素相等）。
+ */
+export interface KvPool {
+	/** 写入层号（kv_source） */
+	src: number;
+	/** 压缩比（缓存视图标注用） */
+	ratio: number;
+	/** 压缩/全局 KV 条目 `[nE × head_dim]`，K = V 共用 */
+	mainKv: Mat;
+	/** indexer K `[nE × index_head_dim]`，从 mainKv 投影（wk → norm → rope） */
+	indexerK?: Mat;
+	/** 候选条目下标（candidate_source 层建的，块级 max 选出） */
+	candidates?: number[];
+	/** 本组最近一次 indexer 的 top-k `[S][k]`（Full 或 Reindex 层写） */
+	topK?: number[][];
 }
 
 export interface LayerCtx {
@@ -825,6 +863,18 @@ export interface LayerCtx {
 	w: unknown;
 	/** 本层输入的 token id 序列（hash 路由查表用；其他插件可忽略） */
 	tokenIds?: number[];
+	/**
+	 * V4.1 的跨层共享池访问器（`forward` 传入）：`pool(src)` 取第 `src` 层（kv_source）
+	 * 写出的池——Reuse / Reindex 层的 compute / steps 用它取压缩 KV 与 top-k。
+	 * R1 / V4 的插件不用它，缺省为 `undefined`。
+	 */
+	pool?: (src: number) => KvPool | undefined;
+	/**
+	 * V4.1 的池写入器（`forward` 传入）：kv_source / Reindex 层在 compute 里把压缩产物
+	 * 写进共享池（`forward` 的 `ModelTrace.kvPools`）——骨架不认插件 trace 的字段，
+	 * 由插件自己决定写什么、按 `pool.src` 落 key。
+	 */
+	writePool?: (pool: KvPool) => void;
 }
 
 // ── 插件协议 ──────────────────────────────────────────────

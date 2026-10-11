@@ -14,12 +14,16 @@ import { mlaAbsorb } from './absorb';
 import { swa } from './swa';
 import { csa } from './csa';
 import { hca } from './hca';
+import { csa2Full, csa2Reindex, csa2Reuse } from './csa2-plugins';
 
 register(mha);
 register(mla);
 register(swa);
 register(csa);
 register(hca);
+register(csa2Full);
+register(csa2Reindex);
+register(csa2Reuse);
 registerImplementation(mlaAbsorb);
 
-export { mha, mla, mlaAbsorb, swa, csa, hca };
+export { mha, mla, mlaAbsorb, swa, csa, hca, csa2Full, csa2Reindex, csa2Reuse };

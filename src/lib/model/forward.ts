@@ -13,7 +13,7 @@
  */
 import { matAdd, matmul, mulberry32, rmsNorm, type Mat } from '$lib/core/mat';
 import { getSemantics, type ResolvedPlugin } from '$lib/core/registry';
-import type { LayerCtx, SlotTrace } from '$lib/core/types';
+import type { KvPool, LayerCtx, SlotTrace } from '$lib/core/types';
 import { ffnIdFor, layerKind, type LayerKind, type ModelSpec } from './config';
 import type { Weights } from './init';
 import { hcHead, hcMix, hcWrite, type HcMixTrace, type HcWriteTrace } from './hc';
@@ -62,6 +62,12 @@ export interface ModelTrace {
 	logits: Mat;
 	/** mHC（V4）专用：模型末尾 hc_head 的中间量 */
 	hcHead?: { pre: Mat; combined: Mat; out: Mat };
+	/**
+	 * V4.1 的跨层共享 KV 池（CSA2）：kv_source 层（Full）在注意力 compute 里通过
+	 * `ctx.writePool` 写入、Reuse / Reindex 层通过 `ctx.pool(src)` 读取。
+	 * 演示里 key = {2, 5, 6}（两个 Full + 一个 Reindex）。R1 / V4 为空 Map。
+	 */
+	kvPools: Map<number, KvPool>;
 }
 
 /** 逐层解析注意力插件（`null` 表示这一层由用户选） */
@@ -94,6 +100,15 @@ export function forward(
 	let x: Mat = embed;
 	let hcHeadTrace: ModelTrace['hcHead'] = undefined;
 
+	// V4.1 的跨层共享 KV 池：kv_source 层写、消费者读（R1 / V4 一直为空 Map）
+	const kvPools = new Map<number, KvPool>();
+	const poolSide = {
+		pool: (src: number) => kvPools.get(src),
+		writePool: (p: KvPool) => {
+			kvPools.set(p.src, p);
+		}
+	};
+
 	const layers: LayerTrace[] = [];
 
 	for (let l = 0; l < cfg.num_layers; l++) {
@@ -106,7 +121,7 @@ export function forward(
 			const streamsIn = streams;
 			// Attention：pre 混合 → RMSNorm → 注意力 → post 写回
 			const attnMix = hcMix(streams, hcW.attn.fn, hcW.attn.base, hcW.attn.scale, hc, cfg.hc_sinkhorn_iters!, cfg.hc_eps!);
-			const attnCtx: LayerCtx = { layer: l, cfg, w: weights.slots[attn.weightKey]?.[l], tokenIds };
+			const attnCtx: LayerCtx = { layer: l, cfg, w: weights.slots[attn.weightKey]?.[l], tokenIds, ...poolSide };
 			const attnTrace = attn.compute(attnMix.normed, attnCtx);
 			const attnWrite = hcWrite(attnTrace.out, streams, attnMix.post, attnMix.comb, hc);
 			// 写回产出**新**的流数组（不再复用旧引用），下一阶段引用它即可
@@ -116,7 +131,7 @@ export function forward(
 			const ffnId = resolveFfn(l);
 			const ffnSpec = getSemantics(ffnId);
 			const ffnMix = hcMix(streams, hcW.ffn.fn, hcW.ffn.base, hcW.ffn.scale, hc, cfg.hc_sinkhorn_iters!, cfg.hc_eps!);
-			const ffnCtx: LayerCtx = { layer: l, cfg, w: weights.slots[ffnId]?.[l], tokenIds };
+			const ffnCtx: LayerCtx = { layer: l, cfg, w: weights.slots[ffnId]?.[l], tokenIds, ...poolSide };
 			const ffnTrace = ffnSpec.compute(ffnMix.normed, ffnCtx);
 			const ffnWrite = hcWrite(ffnTrace.out, streams, ffnMix.post, ffnMix.comb, hc);
 			streams = ffnWrite.newStreams;
@@ -139,7 +154,7 @@ export function forward(
 
 		// ── Attention（前置 RMSNorm + 残差）──────────────
 		const attnIn = rmsNorm(x);
-		const attnCtx: LayerCtx = { layer: l, cfg, w: weights.slots[attn.weightKey]?.[l] };
+		const attnCtx: LayerCtx = { layer: l, cfg, w: weights.slots[attn.weightKey]?.[l], ...poolSide };
 		const attnTrace = attn.compute(attnIn, attnCtx);
 		x = matAdd(x, attnTrace.out);
 		const attnResidual = x;
@@ -148,7 +163,7 @@ export function forward(
 		const ffnId = resolveFfn(l);
 		const ffnSpec = getSemantics(ffnId);
 		const ffnIn = rmsNorm(x);
-		const ffnCtx: LayerCtx = { layer: l, cfg, w: weights.slots[ffnId]?.[l] };
+		const ffnCtx: LayerCtx = { layer: l, cfg, w: weights.slots[ffnId]?.[l], ...poolSide };
 		const ffnTrace = ffnSpec.compute(ffnIn, ffnCtx);
 		x = matAdd(x, ffnTrace.out);
 		const ffnResidual = x;
@@ -180,5 +195,5 @@ export function forward(
 	// `verify` 会断言 logits 全部有限。
 	const logits = matmul(x, weights.lmHead);
 
-	return { tokenIds, embed, layers, hidden: x, logits, hcHead: hcHeadTrace };
+	return { tokenIds, embed, layers, hidden: x, logits, hcHead: hcHeadTrace, kvPools };
 }
