@@ -214,6 +214,69 @@ export interface MatrixView extends TensorViewBase {
 	highlightRows?: [number, number];
 	/** 框出这几列（和 `highlightRows` 配合：如 `[v | s]` 里"打分那几列"） */
 	highlightCols?: number[];
+	/**
+	 * 配合 `animated` / `sync`：**参与动画单元拿共享进度，但数据全量显示、不逐格揭示**。
+	 *
+	 * 用在哪：候选池页的来源矩阵（打分矩阵 I）——它要跟块级最大分同一动画单元
+	 * 同步推进（让琥珀框随块移动），但所有分数一开始就都显示出来（不是一格格长出来）。
+	 */
+	noReveal?: boolean;
+	/**
+	 * 琥珀框随动画逐块推进：每块覆盖 `highlightBlockSize` 个连续**列**，
+	 * 当前块 = `⌊进度 × 块数⌋`；在该块的列范围里，**每列**取该列跨 query 的最大分格、
+	 * 各用一个琥珀细框框出——与块级最大分矩阵"每列取 max"的语义严格一致
+	 * （框住的格子分数 = 块级最大分那一列值的来源）。
+	 *
+	 * 与 `noReveal` 配合：全量显示 + 框随块移动，正好指给块级最大分看来源。
+	 */
+	highlightBlockSize?: number;
+	/**
+	 * `highlightBlockSize` 的框动画占**本视图单元进度**的比例（0..1）——当琥珀框
+	 * 需要跟**同一单元里另一个视图的揭示段**同步时用：框在 `[0, ratio)` 内逐块推进、
+	 * `[ratio, 1]` 静止（让位给后面的阶段，如 blockmax 的选块标记）。
+	 */
+	highlightBlockRatio?: number;
+	/**
+	 * 揭示完成后的**行标记阶段**：按 `rowOrder`（行下标顺序，通常是块分数降序）
+	 * 逐行标记——前 `selected` 行琥珀"选中"、其余行灰化"落选"。
+	 *
+	 * 用在候选池页的块级最大分矩阵：4 块按分数排序、前 `candidate_topk_blocks` 块进池。
+	 * 本视图的动画分两段：`[0, ratio)` 逐格揭示（值出现）、`[ratio, 1]` 行标记。
+	 */
+	pickRows?: { rowOrder: number[]; selected: number };
+	/**
+	 * 高亮列**逐组出现**：`highlightColGroups` = 列下标组的有序列表，随动画进度
+	 * 一组一组框出（每组 = 一个选中块的条目列）。
+	 *
+	 * 用在候选池页的候选池矩阵：选中块按分数降序，块的列先框出、形成"打分区"。
+	 * 与 `noReveal` 配合（全量显示数据、只逐组出琥珀框）。
+	 *
+	 * 缺省 `highlightColRatio` 时按 `⌈进度 × 组数⌉` 渐进；给了 `highlightColRatio`
+	 * + `highlightColSteps` 时与同一单元的"行标记"同步——段进度 `(进度 − ratio)/(1 − ratio)`
+	 * 按 `highlightColSteps` 步取整、截断到组数（选中块标记的同时，对应列组亮起）。
+	 */
+	highlightColGroups?: number[][];
+	/**
+	 * 0..1：`highlightColGroups` 的推进进度（通常 = 本视图的动画单元进度）。
+	 * 给了 `highlightColRatio` 时这段进度从"段起点"之后才开始计入。
+	 */
+	highlightColProgress?: number;
+	/**
+	 * `highlightColGroups` 的段起点（通常 = 同一单元里另一个视图的 `pickRatio`，
+	 * 即"揭示段结束、选块开始"的进度）。给了它 + `highlightColSteps` 后，
+	 * 列组出现与行标记严格同步（不再等独立单元播）。
+	 */
+	highlightColRatio?: number;
+	/** `highlightColRatio` 段内取整的步数（= 行标记的行数，让列组节奏与选中行一一对应）。 */
+	highlightColSteps?: number;
+	/**
+	 * 真实模型里的形状——让 `matrix` 视图也能标出"真实 size 是多少、缩小了几倍"，
+	 * 和 `matmul` / `transform` / `mask` 的注释行对齐（缺省不标）。
+	 *
+	 * 用于**固定维度**的中间量（如候选池的块级最大分、候选池本身）；真实尺寸取决于
+	 * 序列长度的中间量仍写在 `label` 里（见 `components/realShape.ts` 的说明）。
+	 */
+	realShape?: number[];
 }
 
 export interface TilesView extends TensorViewBase {

@@ -93,6 +93,12 @@ export function phaseCells(t: TensorView): number[] {
 				? [cellsOf(t.result.shape), cellsOf(t.then.result.shape)]
 				: [cellsOf(t.result.shape)];
 		case 'matrix':
+			// 有 `pickRows`（选块标记）时拆两段：先逐格揭示、再逐行标记选中/落选。
+			// 行标记一行按"整行"的工作量算（标记是覆盖整行的动作，和揭示一整行同权重），
+			// 否则选块段只占 4/36 进度、排序过程一闪而过。
+			if (t.pickRows) return [t.data.length * (t.data[0]?.length ?? 0), t.pickRows.rowOrder.length * (t.data[0]?.length ?? 1)];
+			// 高亮列逐组出现：工作量 = 组数（不是逐格——数据全量显示，只有框在动）
+			if (t.highlightColGroups) return [t.highlightColGroups.length];
 			return [t.data.length * (t.data[0]?.length ?? 0)];
 		case 'row':
 			// 逐个元素揭示（`v̄` 那样"左边每列算完、这里出一个数"）

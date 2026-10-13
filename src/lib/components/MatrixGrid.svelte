@@ -22,6 +22,14 @@
 		revealOrder = 'row',
 		revealGroup = 0,
 		groupRows = 0,
+		highlightBlockSize,
+		highlightBlockProgress,
+		highlightBlockRatio,
+		pickRows,
+		highlightColGroups,
+		highlightColProgress,
+		highlightColRatio,
+		highlightColSteps,
 		busyCol: busyColProp,
 		busyRows,
 		scanRows,
@@ -82,6 +90,47 @@
 		 */
 		groupRows?: number;
 		/**
+		 * 琥珀框随动画逐块推进：每块覆盖 `highlightBlockSize` 个连续**列**，当前块 =
+		 * `⌊highlightBlockProgress × 块数⌋`；在该块的列范围里，**每列**取该列跨 query
+		 * 的最大分那一格、各用一个琥珀细框框出（与块级最大分"每列取 max"严格一致）。
+		 *
+		 * 与 `reveal` 无关（数据全量显示时也照常工作）——用于候选池页的来源矩阵
+		 * （打分矩阵 I），配合 `noReveal` 全量显示、框随块级最大分同步移动。
+		 */
+		highlightBlockSize?: number;
+		/**
+		 * 0..1：`highlightBlockSize` 的推进进度（通常 = 同一动画单元的共享进度）。
+		 */
+		highlightBlockProgress?: number;
+		/**
+		 * 0..1：`highlightBlockSize` 的框动画占本视图单元进度的比例——框在
+		 * `[0, ratio)` 内逐块推进、`[ratio, 1]` 静止（让位给后面的阶段，如选块标记）。
+		 * 缺省 = 1（整个进度都在动）。
+		 */
+		highlightBlockRatio?: number;
+		/**
+		 * 揭示完成后的**行标记阶段**：按 `rowOrder`（行下标顺序，块分数降序）逐行
+		 * 标记——前 `selected` 行琥珀"选中"、其余行灰化"落选"。
+		 *
+		 * 有它时本视图动画分两段：`[0, ratio)` 逐格揭示、`[ratio, 1]` 行标记，
+		 * `ratio = 格数 / (格数 + rowOrder.length)`。
+		 */
+		pickRows?: { rowOrder: number[]; selected: number };
+		/**
+		 * 高亮列**逐组出现**：列下标组的有序列表，随 `highlightColProgress` 一组一组
+		 * 框出（每组 = 一个选中块的条目列）。缺省 `highlightColProgress` 时一次性全框。
+		 */
+		highlightColGroups?: number[][];
+		/** 0..1：`highlightColGroups` 的推进进度（通常 = 本视图的动画单元进度）。 */
+		highlightColProgress?: number;
+		/**
+		 * `highlightColGroups` 的段起点（= 同一单元里另一个视图的 `pickRatio`）——
+		 * 给了它 + `highlightColSteps` 后，列组出现与行标记严格同步。
+		 */
+		highlightColRatio?: number;
+		/** `highlightColRatio` 段内取整的步数（= 行标记的行数）。 */
+		highlightColSteps?: number;
+		/**
 		 * 正在累加的那一列（整列加淡底）。
 		 *
 		 * 不传就按 `reveal` + `revealOrder` 自己推（`matrix` 视图走这条路）；
@@ -112,6 +161,59 @@
 	const seqOf = (i: number, j: number) => (revealOrder === 'col' ? j * rows + i : i * cols + j);
 
 	/**
+	 * 有 `pickRows`（选块标记）时本视图动画分两段：`[0, pickRatio)` 逐格揭示、
+	 * `[pickRatio, 1]` 行标记。段1 的局部进度、段2 已标记的行数都从这里推。
+	 */
+	const pickRatio = $derived(
+		pickRows ? (rows * cols) / (rows * cols + pickRows.rowOrder.length * cols) : 1
+	);
+	/** 段1（逐格揭示）的局部进度 */
+	const reveal1 = $derived(reveal === undefined ? undefined : Math.min(1, reveal / pickRatio));
+	/** 段2 已标记的行数（按 `rowOrder` 顺序） */
+	const pickCount = $derived(
+		pickRows && reveal !== undefined && reveal > pickRatio
+			? Math.min(
+					pickRows.rowOrder.length,
+					Math.floor(((reveal - pickRatio) / (1 - pickRatio)) * pickRows.rowOrder.length)
+				)
+			: 0
+	);
+	/** 琥珀框的推进进度（`highlightBlockRatio` 压缩：只在 `[0, ratio)` 内动，让位给后面的阶段） */
+	const blockP = $derived(
+		highlightBlockProgress === undefined
+			? undefined
+			: highlightBlockRatio !== undefined && highlightBlockRatio > 0
+				? Math.min(1, highlightBlockProgress / highlightBlockRatio)
+				: highlightBlockProgress
+	);
+	/**
+	 * 高亮列逐组出现的进度：前 `colGroupCount` 组被框出（每组一个琥珀框）。
+	 * 没给 `highlightColProgress` 时一次性全框；给了 `highlightColRatio` +
+	 * `highlightColSteps` 时与同一单元的"行标记"同步——段进度按步取整、截断到组数
+	 * （选中块标记的同时，对应列组亮起）。
+	 */
+	const colGroupCount = $derived(
+		!highlightColGroups
+			? 0
+			: highlightColProgress === undefined
+				? highlightColGroups.length
+				: highlightColRatio !== undefined && highlightColRatio < 1
+					? Math.min(
+							highlightColGroups.length,
+							Math.max(
+								0,
+								Math.floor(
+									((highlightColProgress - highlightColRatio) / (1 - highlightColRatio)) *
+										(highlightColSteps ?? highlightColGroups.length)
+								)
+							)
+						)
+					: Math.min(
+							highlightColGroups.length,
+							Math.max(0, Math.ceil(highlightColProgress * highlightColGroups.length - 1e-9))
+						)
+	);
+	/**
 	 * 已经揭示了几格。
 	 *
 	 * 三种节奏（互斥）：
@@ -124,13 +226,13 @@
 	 *     "本矩阵出了第 g 行第 c 格"——先出完第 1 条，再出第 2 条。
 	 */
 	const revealedCount = $derived(
-		reveal === undefined
+		reveal1 === undefined
 			? rows * cols
 			: groupRows > 0
-				? Math.floor(Math.round(reveal * rows * cols * groupRows) / groupRows)
+				? Math.floor(Math.round(reveal1 * rows * cols * groupRows) / groupRows)
 				: revealGroup > 1
-					? Math.floor(Math.round(reveal * cols * revealGroup) / revealGroup) * rows
-					: Math.round(reveal * rows * cols)
+					? Math.floor(Math.round(reveal1 * cols * revealGroup) / revealGroup) * rows
+					: Math.round(reveal1 * rows * cols)
 	);
 
 	/** 实际渲染的数据：揭示模式下未轮到的格子置为 null */
@@ -155,6 +257,34 @@
 	);
 
 	const effectiveHighlight = $derived(highlightCell ?? revealCell);
+
+	/**
+	 * 琥珀框随动画逐块推进的"当前块每列 max 格"：在块 b 的列范围里，**每列**取该列
+	 * 跨 query 的最大分那一格（跳开 ∅ / 未写出的格）——与块级最大分矩阵"每列取 max"
+	 * 的语义严格一致：框住的格子分数 = 块级最大分那一列值的**来源**。
+	 * progress 到 1 时动画结束，框消失。
+	 */
+	const blockTopCells = $derived.by<{ b: number; cells: { i: number; j: number }[] } | null>(() => {
+		if (!highlightBlockSize || blockP === undefined) return null;
+		const p = blockP;
+		if (p >= 1) return null;
+		const nBlocks = Math.max(1, Math.ceil(cols / highlightBlockSize));
+		const b = Math.min(nBlocks - 1, Math.max(0, Math.floor(p * nBlocks)));
+		const c0 = b * highlightBlockSize;
+		const c1 = Math.min(cols, c0 + highlightBlockSize);
+		const cells: { i: number; j: number }[] = [];
+		for (let j = c0; j < c1; j++) {
+			let best: { i: number; v: number } | null = null;
+			for (let i = 0; i < rows; i++) {
+				const v = data[i]?.[j];
+				if (v !== null && v !== undefined && Number.isFinite(v) && (best === null || v > best.v)) {
+					best = { i, v };
+				}
+			}
+			if (best) cells.push({ i: best.i, j });
+		}
+		return { b, cells };
+	});
 
 	const maxAbs = $derived(maxAbsOf(shown));
 
@@ -327,6 +457,99 @@
 			pointer-events="none"
 			data-highlight-rows="1"
 		/>
+	{/if}
+
+	<!-- 当前块里分数最高的那几格：各一个琥珀细框（"块级最大分取自这几格"） -->
+	{#if blockTopCells}
+		{@const b = blockTopCells.b}
+		{@const bs = highlightBlockSize!}
+		{@const c0 = b * bs}
+		{@const c1 = Math.min(cols, c0 + bs)}
+		{#if c1 > c0}
+			<g data-highlight-block-cells="1">
+				<!-- 当前块的整块范围：淡底做底 -->
+				<rect
+					x={c0 * cellSize}
+					y="0"
+					width={(c1 - c0) * cellSize}
+					height={h}
+					fill="#f59e0b"
+					opacity="0.08"
+					pointer-events="none"
+				/>
+				{#each blockTopCells.cells as c (c.i + ':' + c.j)}
+					<rect
+						x={c.j * cellSize}
+						y={c.i * cellSize}
+						width={cellSize}
+						height={cellSize}
+						fill="none"
+						stroke="#f59e0b"
+						stroke-width="2.5"
+						pointer-events="none"
+					/>
+				{/each}
+			</g>
+		{/if}
+	{/if}
+
+	<!-- 行标记阶段（选块）：按 `rowOrder` 顺序逐行标记——前 `selected` 行琥珀"选中"、其余灰化"落选" -->
+	{#if pickRows && pickCount > 0}
+		<g data-pick-rows="1">
+			{#each pickRows.rowOrder.slice(0, pickCount) as row, k (row)}
+				{@const selected = k < pickRows.selected}
+				<rect
+					x="0"
+					y={row * cellSize}
+					width={w}
+					height={cellSize}
+					fill={selected ? '#f59e0b' : '#94a3b8'}
+					opacity="0.14"
+					pointer-events="none"
+				/>
+				<rect
+					x="0"
+					y={row * cellSize}
+					width={w}
+					height={cellSize}
+					fill="none"
+					stroke={selected ? '#f59e0b' : '#94a3b8'}
+					stroke-width="2.5"
+					pointer-events="none"
+				/>
+			{/each}
+		</g>
+	{/if}
+
+	<!-- 高亮列逐组出现：每组（一个选中块的条目列）一个琥珀框，随动画一组一组框出 -->
+	{#if highlightColGroups && colGroupCount > 0}
+		<g data-highlight-col-groups="1">
+			{#each highlightColGroups.slice(0, colGroupCount) as group, gi (gi)}
+				{@const cs = [...group].sort((a, b) => a - b)}
+				{#if cs.length}
+					<rect
+						x={cs[0] * cellSize}
+						y="0"
+						width={(cs[cs.length - 1] - cs[0] + 1) * cellSize}
+						height={h}
+						fill="#f59e0b"
+						opacity="0.14"
+						pointer-events="none"
+					/>
+					<rect
+						x={cs[0] * cellSize}
+						y="0"
+						width={(cs[cs.length - 1] - cs[0] + 1) * cellSize}
+						height={h}
+						fill="none"
+						stroke="#f59e0b"
+						stroke-width="2.5"
+						pointer-events="none"
+						data-highlight-cols="1"
+					/>
+				{/if}
+			{/each}
+		</g>
 	{/if}
 
 	<!-- 当前正在算的那一格 -->

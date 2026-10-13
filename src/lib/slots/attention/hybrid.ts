@@ -503,7 +503,7 @@ export function hybridHeadSteps(
 			id: `${prefix}-kv`,
 			kind: 'PROJECT',
 			diagram: flow(['x', 'kvraw']),
-			label: `KV 只有**一个头**（MQA）：所有 Q 头共用同一份 K，而且 K = V——键和值就是同一个 ${hd} 维向量。所以这里只投影一次，没有 V 的矩阵。真实是 ${R.d_model} → ${R.head_dim} 维`,
+			label: `KV 只有**一个头**（MQA）：所有 Q 头共用同一份 K，而且 K = V——键和值就是同一个 ${hd} 维向量。所以这里只投影一次，没有 V 的矩阵。真实是 ${R.d_model} → ${R.head_dim} 维。**这是滑窗 KV（SWA）**——每个 token 的精确 K/V，配合压缩 / 全局 KV 一起进注意力`,
 			formula: 'k=v=W^{KV}x',
 			tensors: [
 				{
@@ -518,7 +518,7 @@ export function hybridHeadSteps(
 						[S, hd],
 						[S, R.head_dim],
 						'latent',
-						`← 第 {{step:${prefix}-kv-norm-rope}} 步归一化 + RoPE`
+						`← 滑窗 KV 的原始投影（还没归一化/RoPE）；第 {{step:${prefix}-kv-norm-rope}} 步归一化 + RoPE`
 					)
 				},
 				{
@@ -690,7 +690,7 @@ export function hybridHeadSteps(
 					// 同 q-norm-rope：c128 4-5-6-7 步放大（24 → 32）
 					cellSize: 32,
 					op: 'RMSNorm',
-					input: ref('k_raw', trace.kvRaw, [S, hd], [S, R.head_dim], 'latent'),
+					input: ref('k_raw', trace.kvRaw, [S, hd], [S, R.head_dim], 'latent', '← 上一页的滑窗 k_raw（SWA）'),
 					output: ref('k~', trace.kvNorm, [S, hd], [S, R.head_dim]),
 					tail: {
 						op: 'RoPE',
@@ -739,10 +739,12 @@ export function hybridTailSteps(
 		v4Diagram(variant, active, diagramRole?.src, diagramRole?.srcAction);
 	// V4.1 的 Q 页没有每头 RMSNorm，步骤 id 是 `-q-rope`（V4 是 `-q-norm-rope`）
 	const qRopeRef = cfg.q_head_norm === false ? `${prefix}-q-rope` : `${prefix}-q-norm-rope`;
+	// poolSrc 是 0-indexed 层号，用户可见文案要按 UI 层号（1 开头）显示，所以 +1
+	const poolLayer = poolSrc !== undefined ? poolSrc + 1 : undefined;
 
 	const colLayout = [
 		`前 ${S} 列 = 每个 token 的精确 KV（**蓝框**；每行只留滑窗内那 ${W} 个）`,
-		nE ? (poolSrc ? `接着 ${nE} 列 = 第 ${poolSrc} 层共享的压缩 KV（**琥珀框**）` : `接着 ${nE} 列 = 压缩条目（**琥珀框**）`) : null,
+		nE ? (poolLayer ? `接着 ${nE} 列 = 第 ${poolLayer} 层共享的压缩 KV（**琥珀框**）` : `接着 ${nE} 列 = 压缩条目（**琥珀框**）`) : null,
 		`最后 1 列 = sink 空槽`
 	]
 		.filter(Boolean)
@@ -767,7 +769,7 @@ export function hybridTailSteps(
 							? {
 									from: S,
 									to: S + nE - 1,
-									label: `压缩列 ← 第 ${poolSrc} 层的 top-k 选择（本层不重选，直接读）`
+									label: `压缩列 ← 第 ${poolLayer} 层的 top-k 选择（本层不重选，直接读）`
 								}
 							: {
 									from: S,
@@ -824,9 +826,9 @@ export function hybridTailSteps(
 	];
 	if (trace.compKv) {
 		cacheBlocks.push({
-			name: poolSrc ? `第 ${poolSrc} 层的压缩 KV` : '压缩 KV',
+			name: poolSrc ? `第 ${poolLayer} 层的压缩 KV` : '压缩 KV',
 			label: poolSrc
-				? `由第 ${poolSrc} 层写入，本层按 loc//${plan.ratio} 直接读（不重算），共 ${nE} 条`
+				? `由第 ${poolLayer} 层写入，本层按 loc//${plan.ratio} 直接读（不重算），共 ${nE} 条`
 				: `每 ${plan.ratio} 个 token 压出 1 条，共 ${nE} 条`,
 			size: hd,
 			realSize: R.head_dim,
@@ -844,7 +846,7 @@ export function hybridTailSteps(
 			kind: 'MATMUL',
 			diagram: flow(['q', 'kv', 'ckv', 'itop']),
 			label: nE
-				? `每个头算 Q_h·K_hᵀ 再除以 √${hd} 缩放，得到分数矩阵 S。K 是**所有真实列**拼起来的：前 ${S} 列是每个 token 的**精确 KV**（**蓝框**；每行只有滑窗内那 ${W} 个是活的，其余会被掩码）、后 ${nE} 列是${poolSrc ? `**第 ${poolSrc} 层共享的压缩 KV**（**琥珀框**）——本层不重算，直接读` : '**压缩条目**（**琥珀框**）'}——所以这一步就把"局部精确 + 远处压缩"放进同一个矩阵了。sink 偏置**不在这里**（它不是点积，是直接加在分数上的一项，见下）`
+				? `每个头算 Q_h·K_hᵀ 再除以 √${hd} 缩放，得到分数矩阵 S。K 是**所有真实列**拼起来的：前 ${S} 列是每个 token 的**精确 KV**（**蓝框**；每行只有滑窗内那 ${W} 个是活的，其余会被掩码）、后 ${nE} 列是${poolSrc ? `**第 ${poolLayer} 层共享的压缩 KV**（**琥珀框**）——本层不重算，直接读` : '**压缩条目**（**琥珀框**）'}——所以这一步就把"局部精确 + 远处压缩"放进同一个矩阵了。sink 偏置**不在这里**（它不是点积，是直接加在分数上的一项，见下）`
 				: `每个头算 Q_h·K_hᵀ 再除以 √${hd} 缩放，得到分数矩阵 S。K 就是滑窗里那 ${S} 个 token 的精确 KV（单头，K = V）。sink 偏置**不在这里**（它不是点积，是直接加在分数上的一项，见下）`,
 			formula: 'S_h=\\frac{Q_hK_h^{\\top}}{\\sqrt{d_h}}',
 			tensors: [
@@ -868,7 +870,7 @@ export function hybridTailSteps(
 						'head',
 						nE
 							? poolSrc
-								? `← 转置之后：前 ${S} 列是每个 token 的精确 KV（**蓝框**）、后 ${nE} 列是第 ${poolSrc} 层共享的压缩 KV（**琥珀框**）`
+								? `← 转置之后：前 ${S} 列是每个 token 的精确 KV（**蓝框**）、后 ${nE} 列是第 ${poolLayer} 层共享的压缩 KV（**琥珀框**）`
 								: `← 转置之后：前 ${S} 列是每个 token 的精确 KV（**蓝框**）、后 ${nE} 列是压缩条目（**琥珀框**）`
 							: '← 转置之后，每一列是一个 token 的 K',
 						kvColBands
@@ -914,7 +916,7 @@ export function hybridTailSteps(
 					? `${trace.indexer
 							? '压缩列 ← 上一页 top-k 选中的'
 							: poolSrc
-								? `压缩列 ← 第 ${poolSrc} 层的 top-k（本层不重选）`
+								? `压缩列 ← 第 ${poolLayer} 层的 top-k（本层不重选）`
 								: '压缩列 ← 写出的全保留（HCA 稠密）'}、`
 						: '') +
 				`sink 列 ← 恒保留——这张矩阵的掩码**完全由这几块来源拼成**。` +

@@ -17,6 +17,7 @@
 	import TransformView from './TransformView.svelte';
 	import ValueRow from './ValueRow.svelte';
 	import Emph from './Emph.svelte';
+	import { realLabel } from './realShape';
 
 	/**
 	 * `cellSize`：标了 `fillWidth` 的行由 `StepPanel` 量出来（"占满可用宽度"的格子边长），
@@ -53,8 +54,10 @@
 		view.kind === 'tiles'}
 	data-tensor={view.name}
 >
-	<!-- mask 视图自带表头（要和并排的 transform 对齐），所以不用这里的通用标签行 -->
-	{#if view.label && view.kind !== 'matmul' && view.kind !== 'mask'}
+	<!-- mask 视图自带表头（要和并排的 transform 对齐），所以不用这里的通用标签行；
+	     matrix 视图的注释由 matrix 分支自己管理（有 title → head/real/src 三行，无 title → label），
+	     这里渲染会跟 src/label 重复 -->
+	{#if view.label && view.kind !== 'matmul' && view.kind !== 'mask' && view.kind !== 'matrix'}
 		<div class="label"><Emph text={view.label} /></div>
 	{/if}
 
@@ -72,12 +75,20 @@
 		/>
 	{:else if view.kind === 'matrix'}
 		<!-- 有 `title`（显示名）时画一个和 transform / matmul 同款的表头——`matrix` 的
-		     `name` 是内部 id，不给人看（如压缩器的结果矩阵 `v̄`） -->
+		     `name` 是内部 id，不给人看（如压缩器的结果矩阵 `v̄`）。
+		     后面两行（真实尺寸 / 来源注解）和 mask 视图同款：**有内容才显示**，没有就塞
+		     不换行空格占位，这样和并排的矩阵顶边才对得齐（见 feedback_visual_verify）。 -->
 		{#if view.title}
 			<div class="matrix-head">
 				<span class="nm">{view.title}</span>
 				<span class="sz">[{view.shape.join(' × ')}]</span>
 			</div>
+			<div class="real">{view.realShape ? realLabel({ name: view.name, shape: view.shape, realShape: view.realShape }) : '\u00a0'}</div>
+			<div class="src"><Emph text={view.label ?? '\u00a0'} /></div>
+		{:else}
+			{#if view.label}
+				<div class="label"><Emph text={view.label} /></div>
+			{/if}
 		{/if}
 		<MatrixGrid
 			data={view.data}
@@ -85,10 +96,18 @@
 			highlightCell={view.highlight ?? null}
 			highlightRows={view.highlightRows}
 			highlightCols={view.highlightCols}
-			reveal={view.animated ? progress : undefined}
+			reveal={view.animated && !view.noReveal ? progress : undefined}
 			revealOrder={view.revealOrder}
 			revealGroup={view.revealGroup}
 			groupRows={view.groupRows}
+			highlightBlockSize={view.highlightBlockSize}
+			highlightBlockProgress={view.animated ? progress : undefined}
+			highlightBlockRatio={view.highlightBlockRatio}
+			pickRows={view.pickRows}
+			highlightColGroups={view.highlightColGroups}
+			highlightColProgress={view.animated ? progress : undefined}
+			highlightColRatio={view.highlightColRatio}
+			highlightColSteps={view.highlightColSteps}
 			scanRows={scanRows}
 		/>
 	{:else if view.kind === 'tiles'}
@@ -170,5 +189,19 @@
 	.matrix-head .sz {
 		font-size: 0.66rem;
 		color: #4f46e5;
+	}
+	/* 真实尺寸行 / 来源注解行——和 mask / sum / matmul 的 `.real` / `.src` 同款，
+	   顶边对齐靠"没有内容也渲染一个不换行空格占位"保证 */
+	.real {
+		padding: 0 0.3rem;
+		font-size: 0.58rem;
+		color: #94a3b8;
+		font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+	}
+	.src {
+		padding: 0 0.3rem;
+		font-size: 0.6rem;
+		color: #059669;
+		font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
 	}
 </style>

@@ -13,9 +13,15 @@ import {
 	type HybridTrace,
 	type HybridWeights
 } from './hybrid';
+import type { V4Variant } from './v4-diagram';
 
 /** 纯滑窗层：没有压缩分支，也没有 indexer */
 const PLAN: HybridPlan = { ratio: 0, overlap: false, indexer: false };
+
+/** 这一层的流程图角色：V4.1 用 `v41-swa`（提示不引用 V4 的 C4/C128 层号），V4 用 `swa` */
+function diagramRoleFor(cfg: { kv_source_layer_ids?: number[] }): { variant: V4Variant } | undefined {
+	return cfg.kv_source_layer_ids?.length ? { variant: 'v41-swa' as const } : undefined;
+}
 
 export const swa: SemanticsSpec<HybridTrace> = {
 	id: 'swa',
@@ -38,9 +44,10 @@ export const swa: SemanticsSpec<HybridTrace> = {
 	steps(trace, ctx) {
 		const w = ctx.w as HybridWeights;
 		const prefix = 'swa';
+		const diagramRole = diagramRoleFor(ctx.cfg);
 		return [
-			...hybridHeadSteps(trace, w, ctx.cfg, PLAN, prefix),
-			...hybridTailSteps(trace, w, ctx.cfg, PLAN, prefix)
+			...hybridHeadSteps(trace, w, ctx.cfg, PLAN, prefix, diagramRole),
+			...hybridTailSteps(trace, w, ctx.cfg, PLAN, prefix, undefined, diagramRole)
 		];
 	}
 };

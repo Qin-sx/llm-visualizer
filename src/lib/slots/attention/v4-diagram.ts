@@ -14,8 +14,8 @@
  */
 import type { DataflowEdge, DataflowNode, DataflowSpec } from '$lib/core/types';
 
-/** 三种 V4 层型 + 三种 V4.1 CSA2 角色 */
-export type V4Variant = 'swa' | 'csa' | 'hca' | 'v41-full' | 'v41-reuse' | 'v41-reindex';
+/** 三种 V4 层型 + 四种 V4.1 CSA2 角色（含纯滑窗的 v41-swa） */
+export type V4Variant = 'swa' | 'csa' | 'hca' | 'v41-full' | 'v41-reuse' | 'v41-reindex' | 'v41-swa';
 
 /** V4.1 CSA2 角色：是否真的属于 V4.1 的共享层（用于来源标注） */
 function isV41(v: V4Variant): boolean {
@@ -116,6 +116,14 @@ const GONE: Record<V4Variant, Record<string, string>> = {
 		w: '本层不压缩，直接读',
 		entries: '本层不压缩，直接读',
 		ckv: '本层不压缩，直接读'
+	},
+	// V4.1 纯滑窗层（层 0/1）：与 V4 的 swa 同构，但提示不引用 V4 的 C4/C128 层号
+	'v41-swa': {
+		gate: '纯滑窗层没有压缩支路',
+		w: '纯滑窗层没有压缩支路',
+		entries: '纯滑窗层没有压缩支路',
+		ckv: '纯滑窗层没有压缩支路',
+		itop: '纯滑窗层没有 indexer'
 	}
 };
 
@@ -123,9 +131,10 @@ const HINTS: Record<V4Variant, string> = {
 	swa: '实线 = 本层真正走的路径。灰色虚线 + 淡显 = 这一层**没有**的支路：压缩（`W_gate` → 组内加权平均 → 压缩 KV）与 indexer。所以纯滑窗层只看得到最近那 W 个 token（`swa_window`），更早的历史彻底丢了——翻到 C4 / C128 那两层对比最直观。',
 	csa: '实线 = 本层真正走的路径。三条输入主线（Q、KV、压缩）汇到**同一个** softmax，所以滑窗 KV 与压缩 KV 不是"各算一遍再合并"。`top-k` 那一步决定哪些压缩条目能进注意力——被拒的那些在分数矩阵里是 ∅。',
 	hca: '实线 = 本层真正走的路径。灰色淡显的 `top-k` 是 HCA **没有**的那一步：压缩比大、条目本来就少，全部直接进 softmax，省掉"打分 + 挑选"这套开销。',
-	'v41-full': '实线 = 本层真正走的路径。这是 V4.1 的 **Full 层（源层）**：自己压缩出 KV、自己跑 indexer，并把压缩 KV / top-k **写进共享池**，供后面的 Reuse / Reindex 层直接读。',
+	'v41-full': '实线 = 本层真正走的路径。这是 V4.1 的 **Full 层（源层）**：自己**产出** KV 并跑 indexer，把压缩 KV / top-k **写进共享池**，供后面的 Reuse / Reindex 层直接读。产出方式按源层而定——第 3 层是压缩（ratio-2 gate+pool）；第 6 层是 CED **从编码器末态投影**全局 KV（ratio-1 wkv 直投，不压缩）。',
 	'v41-reuse': '实线 = 本层真正走的路径。**天蓝虚线 + 实底**的压缩支路与 `top-k` = **共享矩阵**：本层**不自己算**，压缩 KV 与选择结果都读共享池（来源层号见节点标注），本层只做 Q 与一次注意力。',
-	'v41-reindex': '实线 = 本层真正走的路径。**天蓝虚线 + 实底**的压缩支路 = 本层**复用共享池里的 KV**（来源层号见标注）；但 `top-k` 是实线——本层**用自己的 Q 在候选池里重打分**（Reindex），不沿用源层的选择。'
+	'v41-reindex': '实线 = 本层真正走的路径。**天蓝虚线 + 实底**的压缩支路 = 本层**复用共享池里的 KV**（来源层号见标注）；但 `top-k` 是实线——本层**用自己的 Q 在候选池里重打分**（Reindex），不沿用源层的选择。',
+	'v41-swa': '实线 = 本层真正走的路径。灰色虚线 + 淡显 = 这一层**没有**的支路：压缩（`W_gate` → 组内加权平均 → 压缩 KV）与 indexer。V4.1 里压缩 / 投影由 **Full 层**负责（第 3 / 6 层），本层只保留滑窗内的精确 KV——更早的历史靠后面读共享池的层捡回来。'
 };
 
 const goneIdsOf = (v: V4Variant) => new Set(Object.keys(GONE[v]));
@@ -138,7 +147,7 @@ function v41Sub(id: string, variant: V4Variant, src?: number, srcAction?: string
 	const text = GONE[variant][id];
 	if (text === undefined) return undefined;
 	if (id === 'ckv' && src !== undefined)
-		return `← 第 ${src} 层${srcAction ?? '压缩'}（本层不压缩）`;
+		return `← 第 ${src + 1} 层${srcAction ?? '压缩'}（本层不压缩）`;
 	return text;
 }
 
@@ -147,7 +156,7 @@ function v41Sub(id: string, variant: V4Variant, src?: number, srcAction?: string
  *
  * 同一层的所有步骤必须共用同一对 `nodes` / `edges` 对象（与 MLA 的做法一致）：
  * 组件据此判断"要不要重画"，`verify` 也据此断言"各步共用同一张图"。
- * 注意：V4.1 的 Reuse / Reindex 层**来源层号不同**（如层 3 读层 2、层 7 读层 5），
+ * 注意：V4.1 的 Reuse / Reindex 层**来源层号不同**（如 UI 第 4 层读第 3 层、第 8 层读第 6 层），
  * 而图的缓存是按 variant 命名的——来源层号不参与缓存，靠调用侧保证"同一步同一来源"。
  */
 const CACHE = new Map<V4Variant, { nodes: DataflowNode[]; edges: DataflowEdge[] }>();
@@ -163,8 +172,8 @@ function build(variant: V4Variant, src?: number, srcAction?: string) {
 	const nodeTone = isV41Shared ? ('shared' as const) : ('gone' as const);
 	const nodes = NODES.map((n) => {
 		if (n.id === 'cache' && isV41Shared && src !== undefined) {
-			// KV Cache 的压缩段来自共享池——sub 里标来源动作（层 2 压缩 / 层 5 CED 投影）
-			return { ...n, sub: `滑窗（本层）+ 第 ${src} 层${srcAction ?? '压缩'}` };
+			// KV Cache 的压缩段来自共享池——sub 里标来源动作（第 3 层压缩 / 第 6 层 CED 投影）
+			return { ...n, sub: `滑窗（本层）+ 第 ${src + 1} 层${srcAction ?? '压缩'}` };
 		}
 		if (!gone.has(n.id)) return n;
 		const sub = v41Sub(n.id, variant, src, srcAction);

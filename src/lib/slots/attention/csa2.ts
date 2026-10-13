@@ -63,7 +63,7 @@ export type Csa2Role = 'full' | 'reindex' | 'reuse';
 
 export interface Csa2Plan {
 	role: Csa2Role;
-	/** 压缩比（层 2-4 是 2、层 5-7 是 1） */
+	/** 压缩比（UI 第 3-5 层是 2、第 6-8 层是 1） */
 	ratio: number;
 	/** 本层是 kv_source：自己压缩、写池 */
 	isKvSource: boolean;
@@ -555,7 +555,15 @@ function toHybridPlan(plan: Csa2Plan): HybridPlan {
 }
 
 /** 压缩器的步骤（Full 层）：ratio-2 gate+pool；ratio-1 只有 wkv 直投（CED 全局 KV） */
-function csa2CompressSteps(trace: Csa2Trace, w: Csa2Weights, cfg: ModelConfigLike, prefix: string, plan: Csa2Plan): Step[] {
+function csa2CompressSteps(
+	trace: Csa2Trace,
+	w: Csa2Weights,
+	cfg: ModelConfigLike,
+	prefix: string,
+	plan: Csa2Plan,
+	/** 本层的 UI 层号（1 开头），label 里的层号都按它写——和界面"检视层"一致 */
+	layer: number
+): Step[] {
 	const S = cfg.seq_len;
 	const D = cfg.d_model;
 	const hd = cfg.head_dim;
@@ -569,21 +577,24 @@ function csa2CompressSteps(trace: Csa2Trace, w: Csa2Weights, cfg: ModelConfigLik
 
 	if (plan.ratio === 1) {
 		// ratio-1：wkv 直投（无 gate）→ RMSNorm → RoPE（CED：从编码器末态投影全局 KV）
+		// 编码器末态 = 上一层（UI 层号 − 1）的输出；decoder 段的 Reuse / Reindex 读本层池（UI 层号 + 1 / + 2）
+		const prev = layer - 1;
+		const readers = `${layer + 1}-${layer + 2}`;
 		return [
 			{
 				id: `${prefix}-global-kv`,
 				kind: 'PROJECT',
 				diagram: flow(['kvraw']),
-				label: `**CED：全局 KV 从这里来**——层 5 从"编码器末态"（= 层 4 的输出，即本层输入 X）用 W_KV 投影一份潜向量，再过 RMSNorm + RoPE 就是**全局 KV**（ratio-1：每个位置一条，K = V）。这是解码器段唯一一份 main KV——层 6-7 直接读它，不再各自投影`,
+				label: `**CED：全局 KV 从这里来**——第 ${layer} 层从"编码器末态"（= 第 ${prev} 层的输出，即本层输入 X）用 W_KV 投影一份潜向量，再过 RMSNorm + RoPE 就是**全局 KV**（ratio-1：每个位置一条，K = V）。这是解码器段唯一一份 main KV——第 ${readers} 层直接读它，不再各自投影`,
 				formula: 'k^{\\mathrm{glob}}_t=\\mathcal{R}\\!\\left(\\mathrm{RMSNorm}(W^{KV}x_t)\\right)',
 				tensors: [
 					{
 						name: `${prefix}-global-kv-mm`,
 						kind: 'matmul',
 						shape: [S, hd],
-						a: ref('X', trace.x, [S, D], [S, R.d_model], 'input', '← 层 4 的输出（编码器末态）'),
+						a: ref('X', trace.x, [S, D], [S, R.d_model], 'input', `← 第 ${prev} 层的输出（编码器末态）`),
 						b: ref('W_KV', w.wkv, [D, hd], [R.d_model, R.head_dim], 'weight'),
-						out: ref('k_raw', compress.kv, [S, hd], [S, R.head_dim], 'latent', '← 投影出的潜向量（还没归一化/RoPE）')
+						out: ref('k_raw', compress.kv, [S, hd], [S, R.head_dim], 'latent', '← 全局 KV（CED）的原始投影，从编码器末态来（还没归一化/RoPE）')
 					},
 					{
 						name: `${prefix}-global-kv-note`,
@@ -607,7 +618,7 @@ function csa2CompressSteps(trace: Csa2Trace, w: Csa2Weights, cfg: ModelConfigLik
 						shape: [S, hd],
 						cellSize: 32,
 						op: 'RMSNorm',
-						input: ref('k_raw', compress.kv, [S, hd], [S, R.head_dim], 'latent'),
+						input: ref('k_raw', compress.kv, [S, hd], [S, R.head_dim], 'latent', '← 上一页的全局 k_raw（CED）'),
 						output: ref('k~', compress.entriesNorm, [S, hd], [S, R.head_dim]),
 						tail: {
 							op: 'RoPE',
@@ -620,7 +631,7 @@ function csa2CompressSteps(trace: Csa2Trace, w: Csa2Weights, cfg: ModelConfigLik
 						kind: 'shape',
 						wide: true,
 						shape: [S, hd],
-						note: `归一化 + RoPE 与 V4 的 SWA 支路同格式；这里的产物写进共享池（第 ${plan.kvSrc} 层），后续 Reuse / Reindex 层直接读`
+						note: `归一化 + RoPE 与 V4 的 SWA 支路同格式；这里的产物写进共享池（第 ${plan.kvSrc + 1} 层），后续 Reuse / Reindex 层直接读`
 					}
 				]
 			}
@@ -759,7 +770,7 @@ function csa2CompressSteps(trace: Csa2Trace, w: Csa2Weights, cfg: ModelConfigLik
 					kind: 'shape' as const,
 					wide: true,
 					shape: [nE, hd],
-					note: `压缩 KV 只有 ${nE} 条（真实 ratio-2：每 2 个 token 一条）。**无 ape**：V4.1 的压缩条目不带绝对位置编码（对比 V4 CSA 的 ape 页）。产物写进共享池（第 ${plan.kvSrc} 层），后续 Reuse / Reindex 层直接读`
+					note: `压缩 KV 只有 ${nE} 条（真实 ratio-2：每 2 个 token 一条）。**无 ape**：V4.1 的压缩条目不带绝对位置编码（对比 V4 CSA 的 ape 页）。产物写进共享池（第 ${plan.kvSrc + 1} 层），后续 Reuse / Reindex 层直接读`
 				}
 			]
 		}
@@ -917,7 +928,7 @@ function csa2IndexerSteps(trace: Csa2Trace, w: Csa2Weights, cfg: ModelConfigLike
 					a: ref('q^I_0', idx.qFlat.map((r) => r.slice(0, idxHd)), [S, idxHd], [S, R.index_head_dim], 'head', '← head 0 的 q'),
 					b: ref('k^Iᵀ', transpose(idx.kEntries), [idxHd, nE], [R.index_head_dim, nE], 'head',
 						plan.role === 'reindex'
-							? `← indexer K 转置（**Reindex 复用第 ${plan.kvSrc} 层的 k^I，不重投**）`
+							? `← indexer K 转置（**Reindex 复用第 ${plan.kvSrc + 1} 层的 k^I，不重投**）`
 							: `← indexer K 转置（第 {{step:${prefix}-indexer-k}} 步投好）`),
 					out: ref('头0分数', idx.headRaw[0], [S, nE], [S, nE], 'result', '← head 0 的 q·k 原始分数；∅ = 条目还没写出来')
 				},
@@ -1080,17 +1091,37 @@ function csa2IndexerSteps(trace: Csa2Trace, w: Csa2Weights, cfg: ModelConfigLike
 					mask: topkMask,
 					matrixName: 'top-k 选择',
 					label: `每个 query 从 I 自己的那一行挑分数最高的 top-${k} 条（真实 ${R.index_topk} 条）：选中才保留、其余置 ∅。**这张 0/1 矩阵就是下一步注意力掩码里"压缩条目列"的直接来源**`
-				}
+				},
+				// Reindex 页：候选池（打分区）——第 kvSrc+1 层建的池传过来，本层只在池内打分。
+				// 跨层引用：数据在全局 kvPools（trace 的 scope）、标签用层号，不走步骤号占位符。
+				// 放 row 2：打分页 row 1（sum + top-k 两个 [8×8]）加第三个 [8×8] 会横向溢出，候选池单独一行不打挤
+				...(plan.role === 'reindex' && idx.scope && idx.scope.length
+					? ([
+							{
+								name: `${prefix}-indexer-scope-pool`,
+								kind: 'matrix' as const,
+								row: 2,
+								shape: [S, nE],
+								cellSize: 22,
+								title: '候选池（打分区）',
+								// 琥珀框出池内列（按选中块的列分组，与第 6 层建池页的框一致）
+								highlightColGroups: Array.from(
+									{ length: Math.ceil(idx.scope.length / (cfg.candidate_block_size ?? 1)) },
+									(_, g) => idx.scope!.slice(g * (cfg.candidate_block_size ?? 1), Math.min(idx.scope!.length, (g + 1) * (cfg.candidate_block_size ?? 1)))
+								),
+								data: idx.logits,
+								label: `← 第 ${plan.kvSrc + 1} 层建的候选池（打分区，全局一份、每行相同）：琥珀列 = 池内。本层只在池内打分——池外条目不参与（∅），top-k 也只从池里挑`
+							}
+						] as Step['tensors'])
+					: [])
 			]
 		}
 	];
 
-	// 候选源层（层 5）追加"候选池"页
+	// 候选源层（UI 第 6 层）追加"候选池"页
 	if (plan.isCandidateSource) {
-		const candidates = trace.pool?.candidates ?? [];
-		const candMask: Mat = Array.from({ length: S }, (_, i) =>
-			Array.from({ length: nE }, (_, e) => (candidates.includes(e) ? 1 : 0))
-		);
+		// full 层的 trace.pool 是 undefined（csa2Compute 里 full 自己读局部 pool，不写 trace.pool），
+		// 所以候选池必须从这一层的 indexer 打分**重新算**（与 compute 写进 kvPools 的是同一份推导）。
 		/** 块级取 max：按块摊成 [nBlocks × nE]（每行 = 一块，块内格填该块最大分） */
 		const bs = cfg.candidate_block_size ?? 1;
 		const nBlocks = Math.ceil(nE / bs);
@@ -1102,36 +1133,89 @@ function csa2IndexerSteps(trace: Csa2Trace, w: Csa2Weights, cfg: ModelConfigLike
 				return mx;
 			})
 		);
+		const REAL_BLOCKS = R.candidate_topk_blocks ?? nBlocks;
+		const REAL_POOL = (cfg.candidate_topk_blocks ?? 1) * (cfg.candidate_block_size ?? 1);
+		const REAL_POOL_TOTAL = (R.candidate_topk_blocks ?? 1) * (R.candidate_block_size ?? 1);
+		// 选块：每块的块级最大分（块内所有格子再取 max，与 csa2BuildCandidates 同一推导）降序排序
+		const pickK = cfg.candidate_topk_blocks ?? 1;
+		const blockScores = blockMaxRows
+			.map((row, b) => ({ b, v: Math.max(...row.filter((v) => v !== NEG_INF && Number.isFinite(v))) }))
+			.sort((a, b2) => b2.v - a.v);
+		// blockmax 矩阵的行标记顺序（分数降序的行下标）与选中块的列组（按选中顺序，给 pool 逐组框）
+		const rowOrder = blockScores.map((s) => s.b);
+		const colGroups = blockScores.slice(0, pickK).map((s) =>
+			Array.from({ length: bs }, (_, k) => s.b * bs + k).filter((e) => e < nE)
+		);
+		// blockmax 的动画两段：揭示段占比（供 src 的琥珀框压缩到同一窗口同步）——
+		// 与 MatrixGrid 的 `pickRatio`（段2 每行按整行权重）同一公式
+		const pickRatio = (nBlocks * nE) / (nBlocks * nE + nBlocks * nE);
 		steps.push({
 			id: `${prefix}-candidate`,
 			kind: 'SELECT',
 			diagram: flow(['itop']),
-			label: `**Hierarchical Sparse Indexer：建候选池**——第 ${plan.kvSrc} 层扫完全量后，按块取**块内最大分数**选 top-${cfg.candidate_topk_blocks} 块（每块 ${bs} 条 = 共 ${(cfg.candidate_topk_blocks ?? 1) * bs} 个候选位置）。后续 Reindex 层**只在池里打分**——深层 indexer 的成本从此与上下文长度无关`,
+			label: `**Hierarchical Sparse Indexer：建候选池**——第 ${plan.kvSrc + 1} 层扫完全量后，按块取**块内最大分数**选 top-${cfg.candidate_topk_blocks} 块（每块 ${bs} 条 = 共 ${(cfg.candidate_topk_blocks ?? 1) * bs} 个候选位置）。后续 Reindex 层**只在池里打分**——深层 indexer 的成本从此与上下文长度无关`,
 			formula: '\\text{pool}=\\mathrm{top\\text{-}blocks}\\!\\left(\\max_{e\\in\\text{block}} I_{i,e}\\right)',
 			tensors: [
+				// 来源：打分矩阵 I（上一步 indexer-logits 的产物）——让块级最大分"从哪来"一眼可见
+				{
+					name: `${prefix}-candidate-src`,
+					kind: 'matrix' as const,
+					row: 1,
+					shape: [S, nE],
+					cellSize: 22,
+					title: '打分矩阵 I',
+					// 与右边"块级最大分"同一动画单元（同 row + sync）同步推进：`noReveal`
+					// 让所有分数一开始就全量显示，`highlightBlockSize` 让琥珀框随块级最大分
+					// 逐块移动、框出当前块分数最高的那几格（块级 max 的来源）；
+					// `highlightBlockRatio` 把框压缩到 blockmax 的揭示段（选块标记段里 src 静止）。
+					animated: true,
+					sync: true,
+					noReveal: true,
+					highlightBlockSize: bs,
+					highlightBlockRatio: pickRatio,
+					data: idx.logits,
+					label: `← 上一步 indexer-logits 的产物（每 query 一行、每条目一列；∅ = 条目还没写出来）。按块取列内最大分 → 右边`
+				},
 				{
 					name: `${prefix}-candidate-blockmax`,
 					kind: 'matrix' as const,
 					row: 1,
 					shape: [nBlocks, nE],
+					realShape: [REAL_BLOCKS, R.candidate_block_size ?? nE],
 					cellSize: 22,
 					animated: true,
+					// 与左边"打分矩阵 I"同一动画单元（同 row + sync）：两块同步推进，
+					// 块级最大分逐块揭示时，来源矩阵同帧框出当前块的那几格；
+					// `pickRows` 让揭示完后再演"选块"：按块分数降序逐行标记（前 top-k 琥珀选中、其余灰落选）
+					sync: true,
 					overview: '块级最大分',
 					title: '块级最大分',
 					groupRows: 1,
+					pickRows: { rowOrder, selected: pickK },
 					data: blockMaxRows,
-					label: `按块取块内最大分：每行一块（${bs} 条连续条目），格 = 该块所有 token 里最大的那个分数`
+					label: `← 每行一块（${bs} 条连续条目），格 = 该块内所有 token 里最大的那个分数`
 				},
 				{
-					name: `${prefix}-candidate-mask`,
-					kind: 'mask',
+					name: `${prefix}-candidate-pool`,
+					kind: 'matrix' as const,
 					row: 1,
 					shape: [S, nE],
+					realShape: [S, REAL_POOL_TOTAL],
+					cellSize: 22,
+					// 与 src/blockmax 合并进同一动画单元（同 row + sync）：`noReveal` 全量显示分数，
+					// `highlightColGroups` 让琥珀列**逐组出现**；`highlightColRatio` + `highlightColSteps`
+					// 让列组出现与 blockmax 的行标记严格同步——块 1 标记选中的同时块 1 的列进池、
+					// 块 0 标记选中的同时块 0 的列进池（不再等独立单元播，第二框也就不会慢一拍）
+					animated: true,
+					sync: true,
+					noReveal: true,
 					overview: '候选池',
-					scores: idx.logits,
-					mask: candMask,
-					matrixName: '候选池',
-					label: `选中块的条目全进池（每行同一份 0/1——池是全局的，不是按 query 的）；后续 Reindex 层只在这里面打分`
+					title: '候选池（打分区）',
+					highlightColGroups: colGroups,
+					highlightColRatio: pickRatio,
+					highlightColSteps: nBlocks,
+					data: idx.logits,
+					label: `← 琥珀框出的列 = 池内候选位置（全局一份、每行相同）；池外只是**不在打分区**，KV 仍保留`
 				}
 			]
 		});
@@ -1148,7 +1232,7 @@ export function csa2Steps(trace: Csa2Trace, ctx: LayerCtx): Step[] {
 	const hplan = toHybridPlan(plan);
 	// 流程图角色：Full = 源层（压缩 + indexer 实线）、Reuse = 都读共享、Reindex = 复用 KV + 池内重打分。
 	// 来源层号（Reuse / Reindex 读哪个 kv_source）传给 ckv 节点的淡显说明。
-	// 源层动作（cache 节点标"来自哪"）：层 2 是真压缩（ratio-2 gate+pool）、层 5 是 CED 全局 KV 投影（ratio-1 wkv 直投）。
+	// 源层动作（cache 节点标"来自哪"）：UI 第 3 层是真压缩（ratio-2 gate+pool）、第 6 层是 CED 全局 KV 投影（ratio-1 wkv 直投）。
 	const srcRatio = plan.kvSrc >= 0 ? cfg.compress_ratios?.[plan.kvSrc] ?? 0 : 0;
 	const srcAction = srcRatio > 1 ? '压缩' : '投影';
 	const diagramRole: { variant: V4Variant; src?: number; srcAction?: string } = (
@@ -1160,7 +1244,7 @@ export function csa2Steps(trace: Csa2Trace, ctx: LayerCtx): Step[] {
 	) as { variant: V4Variant; src?: number; srcAction?: string };
 	const steps: Step[] = [
 		...hybridHeadSteps(trace, w.base, cfg, hplan, prefix, diagramRole),
-		...(plan.role === 'full' ? csa2CompressSteps(trace, w, cfg, prefix, plan) : []),
+		...(plan.role === 'full' ? csa2CompressSteps(trace, w, cfg, prefix, plan, ctx.layer + 1) : []),
 		...(plan.isIndexSource ? csa2IndexerSteps(trace, w, cfg, prefix, plan) : [])
 	];
 	// 消费者层（Reuse / Reindex）把池来源传给 hybridTailSteps：琥珀段文案/掩码来源跟着变

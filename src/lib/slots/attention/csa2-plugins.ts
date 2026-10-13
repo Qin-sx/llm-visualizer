@@ -5,10 +5,10 @@
  * 推导（`csa2PlanOf`）——Full / Reindex / Reuse 是"谁算谁共享"，不是三种算法，
  * 所以是三个薄壳，和 V4 的 swa / csa / hca 三壳套 hybrid 是同一套组织方式。
  *
- * 层分配（`V4_1_FLASH_MODEL.attnByLayer`）：
- *   `csa2-full`：层 2（ratio-2 编码器组 Full）、层 5（ratio-1 全局 KV Full + 候选源）
- *   `csa2-reindex`：层 6（复用层 5 的池，用自己的 q^I 在候选池里重打分）
- *   `csa2-reuse`：层 3/4/7（不压缩不检索，直接读池 + 复用最近的 top-k）
+ * 层分配（`V4_1_FLASH_MODEL.attnByLayer`，层号按 UI 1 开头）：
+ *   `csa2-full`：第 3 层（ratio-2 编码器组 Full）、第 6 层（ratio-1 全局 KV Full + 候选源）
+ *   `csa2-reindex`：第 7 层（复用第 6 层的池，用自己的 q^I 在候选池里重打分）
+ *   `csa2-reuse`：第 4/5/8 层（不压缩不检索，直接读池 + 复用最近的 top-k）
  */
 import { register } from '$lib/core/registry';
 import type { SemanticsSpec } from '$lib/core/types';
@@ -46,7 +46,7 @@ function shell(
 export const csa2Full: SemanticsSpec<Csa2Trace> = shell(
 	'csa2-full',
 	'CSA2 Full',
-	'自己算 main KV 与 indexer K、扫全量建索引（candidate source 还建候选池）。只有 4 个 kv_source 层（演示层 2 / 5）是它——其余层都读它的池。',
+	'自己算 main KV 与 indexer K、扫全量建索引（candidate source 还建候选池）。只有 4 个 kv_source 层（演示第 3 / 6 层）是它——其余层都读它的池。',
 	'C^l=HW^{KV}_{l},\\qquad I=\\mathrm{TopK}\\!\\left(Q_{\\mathrm{index}}^l K_{\\mathrm{index}}^\\top\\right)'
 );
 
